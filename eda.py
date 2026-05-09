@@ -34,10 +34,7 @@ n_snap = len(snapshot)
 print("snapshot loaded: %d rows" % n_snap)
 
 # check encoded features
-missing_matrices = []
-for name, path in matrix_files.items():
-    if not path.exists():
-        missing_matrices.append(name)
+missing_matrices = [name for name, path in matrix_files.items() if not path.exists()]
 
 if missing_matrices:
     print(f"missing matrices: {missing_matrices}")
@@ -214,10 +211,7 @@ print("\n" + "=" * 60)
 print("Sparse matrices")
 print("=" * 60)
 
-missing = []
-for name, p in matrix_files.items():
-    if not p.exists():
-        missing.append(name)
+missing = [name for name, p in matrix_files.items() if not p.exists()]
 
 if missing:
     print(f"missing matrices: {missing}. Run prepare.py first. Skipping section 3.")
@@ -226,18 +220,12 @@ else:
         # print stats
         # is cur values, history values mostly populated or empty
         mat = load_npz(p)
-        row_sums = mat.sum(axis=1)
-        per_row = np.asarray(row_sums)
-        per_row = per_row.flatten()
+        per_row = np.asarray(mat.sum(axis=1)).flatten()
 
-        total_cells = mat.shape[0] * mat.shape[1]
-        density = mat.nnz / total_cells
+        density = mat.nnz / (mat.shape[0] * mat.shape[1])
 
         print(f"\n{name}: shape={mat.shape}, nnz={mat.nnz:,}, density={density:.4%}")
-        mean_v = per_row.mean()
-        med_v = np.median(per_row)
-        max_v = per_row.max()
-        print("  per-admission counts: mean=%.1f, median=%.0f, max=%d" % (mean_v, med_v, max_v))
+        print("  per-admission counts: mean=%.1f, median=%.0f, max=%d" % (per_row.mean(), np.median(per_row), per_row.max()))
         zero_rows = (per_row == 0).sum()
         print(f"  rows with zero entries: {zero_rows:,}")
 
@@ -276,12 +264,8 @@ else:
     # what share of administrations are from the popular drugs
     # higher means stronger popularity bias, which means it may be harder to beat.
     n_unique_drugs = len(drug_popularity)
-    top_10pct = int(n_unique_drugs * 0.1)
-    if top_10pct < 1:
-        top_10pct = 1
-    top_share_sum = drug_popularity.head(top_10pct).sum()
-    total_sum = drug_popularity.sum()
-    share = top_share_sum / total_sum
+    top_10pct = max(1, int(n_unique_drugs * 0.1))
+    share = drug_popularity.head(top_10pct).sum() / drug_popularity.sum()
     print(f"\ntop 10% of drugs ({top_10pct:,}) cover {share:.1%} of administrations")
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))

@@ -29,10 +29,8 @@ NEGATIVES_PER_ADMISSION = 10
 # and a list of ICD codes, mapping column index to code
 def build_current_dx_matrix(snapshot, diagnoses):
     # map each hadm_id to row number
-    hadm_to_row = {}
     snap_hadms = snapshot["hadm_id"].tolist()
-    for i in range(len(snap_hadms)):
-        hadm_to_row[snap_hadms[i]] = i
+    hadm_to_row = {h: i for i, h in enumerate(snap_hadms)}
 
     dx = diagnoses.dropna(subset=["hadm_id", "icd_code"]).copy()
     dx["icd_code"] = dx["icd_code"].fillna("").astype(str).str.strip()
@@ -42,9 +40,7 @@ def build_current_dx_matrix(snapshot, diagnoses):
 
     dx_codes = sorted(dx["icd_code"].unique())
     # map icd code to column number
-    code_to_col = {}
-    for i, code in enumerate(dx_codes):
-        code_to_col[code] = i
+    code_to_col = {code: i for i, code in enumerate(dx_codes)}
 
     # now build sparse matrix (multi-hot)
     rows = dx["hadm_id"].map(hadm_to_row).values
@@ -58,12 +54,8 @@ def build_current_dx_matrix(snapshot, diagnoses):
 # includes prior diagnoses, medications, number of admissions, days since last admission
 # basically collapsing user history into a fixed size feature vector
 def compute_history(snapshot, diagnoses, interactions, dx_codes, medications):
-    dx_to_col = {}
-    for i, c in enumerate(dx_codes):
-        dx_to_col[c] = i
-    med_to_col = {}
-    for i, m in enumerate(medications):
-        med_to_col[m] = i
+    dx_to_col = {c: i for i, c in enumerate(dx_codes)}
+    med_to_col = {m: i for i, m in enumerate(medications)}
 
     n_rows = len(snapshot)
     num_prior_admissions = np.zeros(n_rows, dtype=int)
@@ -82,10 +74,8 @@ def compute_history(snapshot, diagnoses, interactions, dx_codes, medications):
     for hadm_id, grp in interactions.groupby("hadm_id"):
         current_meds_by_hadm[hadm_id] = set(grp["medication"])
 
-    prior_dx_rows = []
-    prior_dx_cols = []
-    prior_med_rows = []
-    prior_med_cols = []
+    prior_dx_rows, prior_dx_cols = [], []
+    prior_med_rows, prior_med_cols = [], []
 
     # go through each patient's admissions in chronological order
     # and build their history
@@ -154,19 +144,13 @@ def make_label_table(snapshot, interactions):
 
     rows = []
     for hadm_id in snapshot["hadm_id"]:
-        if hadm_id in positive_by_hadm:
-            positive_drugs = positive_by_hadm[hadm_id]
-        else:
-            positive_drugs = set()
+        positive_drugs = positive_by_hadm.get(hadm_id, set())
 
         for drug in sorted(positive_drugs):
             rows.append({"hadm_id": hadm_id, "candidate_drug": drug, "label": 1})
 
         # sample negatives from drugs not given in this admission
-        non_positive_drugs = []
-        for d in all_drugs:
-            if d not in positive_drugs:
-                non_positive_drugs.append(d)
+        non_positive_drugs = [d for d in all_drugs if d not in positive_drugs]
 
         n_neg = min(NEGATIVES_PER_ADMISSION, len(non_positive_drugs))
         negative_drugs = rng.choice(non_positive_drugs, size=n_neg, replace=False)
@@ -260,10 +244,8 @@ metadata = {
     "negatives_per_admission": NEGATIVES_PER_ADMISSION,
     "random_state": RANDOM_STATE,
 }
-out_path = OUT_DIR / "feature_metadata.json"
-fp = open(out_path, "w")
-json.dump(metadata, fp, indent=2)
-fp.close()
+with open(OUT_DIR / "feature_metadata.json", "w") as fp:
+    json.dump(metadata, fp, indent=2)
 
 print("done")
 

@@ -1,0 +1,10 @@
+# Directories
+docs/
+mimic_data/
+mimic_env/
+outputs/
+scripts/
+
+# Non-Python/notebook files
+CLAUDE.md
+.DS_Store
