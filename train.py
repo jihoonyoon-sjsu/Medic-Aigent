@@ -133,12 +133,6 @@ p, r, n = evaluate(popularity_preds, ground_truth)
 print(f"\npopularity -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 
 
-# model 2: medication popularity among admissions with same diagnosis
-# if test admission has diagnosis codes a/b/c, recommend drugs
-# that were given in other admissions with the same ones
-print("Building diagnosis popularity baseline...")
-current_dx = load_npz(PROCESSED_DIR / "current_dx_matrix.npz")
-
 hadm_ids = features["hadm_id"].to_numpy()
 
 train_rows_list = []
@@ -154,46 +148,8 @@ test_rows = np.array(test_rows_list)
 
 train_hadm = hadm_ids[train_rows]
 test_hadm = hadm_ids[test_rows]
-train_dx = current_dx[train_rows]
-test_dx = current_dx[test_rows]
 
-drugs = train_interactions["medication"].unique().tolist()
-
-drug_to_idx = {}
-for i, drug in enumerate(drugs):
-    drug_to_idx[drug] = i
-
-train_row_by_hadm = {}
-for i, hadm_id in enumerate(train_hadm):
-    train_row_by_hadm[hadm_id] = i
-
-rows = train_interactions["hadm_id"].map(train_row_by_hadm).values
-cols = train_interactions["medication"].map(drug_to_idx).values
-train_drug = csr_matrix(
-    (np.ones(len(rows), dtype=np.int8), (rows, cols)),
-    shape=(len(train_rows), len(drugs)),
-)
-
-drug_dx = train_drug.T @ train_dx
-test_scores = test_dx @ drug_dx.T
-
-dx_popularity_preds = {}
-for i, hadm_id in enumerate(test_hadm):
-    scores = test_scores[i].toarray().ravel()
-
-    order = np.argsort(-scores)
-    ranked = []
-    for j in order:
-        if scores[j] > 0:
-            ranked.append(drugs[j])
-    dx_popularity_preds[hadm_id] = ranked
-
-p, r, n = evaluate(dx_popularity_preds, ground_truth)
-print(
-    f"diagnosis popularity -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}"
-)
-
-# Model 3: KNN using full admission feature set
+# Model 2: KNN using full admission feature set
 print("Building full-feature KNN baseline...")
 feature_matrix = build_full_feature_matrix(features)
 train_features = feature_matrix[train_rows]
