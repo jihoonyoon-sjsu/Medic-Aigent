@@ -6,8 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.sparse import load_npz
 
-DATA_DIR = Path("mimic_data/baseline_tables")
-PROCESSED_DIR = Path("mimic_data/processed")
+from config import DATA_DIR, PROCESSED_DIR, LAB_SOURCES, load_raw_tables
+
 OUT_DIR = Path("outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -24,14 +24,23 @@ matrix_files = {
     "current_dx": PROCESSED_DIR / "current_dx_matrix.npz",
     "prior_dx": PROCESSED_DIR / "prior_dx_matrix.npz",
     "prior_med": PROCESSED_DIR / "prior_med_matrix.npz",
+    "current_proc": PROCESSED_DIR / "current_proc_matrix.npz",
+    "prior_proc": PROCESSED_DIR / "prior_proc_matrix.npz",
 }
 
 # run prepare.py before running
 
-# load feature table
+# load processed tables
 snapshot = pd.read_csv(snapshot_path, low_memory=False)
 n_snap = len(snapshot)
 print("snapshot loaded: %d rows" % n_snap)
+
+labels = None
+if labels_path.exists():
+    labels = pd.read_csv(labels_path, low_memory=False)
+    print(f"labels loaded: {len(labels):,} rows")
+else:
+    print(f"missing {labels_path}")
 
 # check encoded features
 missing_matrices = [name for name, path in matrix_files.items() if not path.exists()]
@@ -39,28 +48,19 @@ missing_matrices = [name for name, path in matrix_files.items() if not path.exis
 if missing_matrices:
     print(f"missing matrices: {missing_matrices}")
 else:
-    # all of these should have same # of rows
-    current_dx = load_npz(matrix_files["current_dx"])
-    prior_dx = load_npz(matrix_files["prior_dx"])
-    prior_med = load_npz(matrix_files["prior_med"])
-    row_counts_match = (
-        n_snap == current_dx.shape[0]
-        and n_snap == prior_dx.shape[0]
-        and n_snap == prior_med.shape[0]
-    )
+    # all matrix should have same rows
+    row_counts_match = True
+    for name, p in matrix_files.items():
+        mat = load_npz(p)
+        if mat.shape[0] != n_snap:
+            row_counts_match = False
+            print(f"  row count mismatch: {name} has {mat.shape[0]} rows, snapshot has {n_snap}")
     print(f"snapshot/matrix row counts match: {row_counts_match}")
 
 # interactions table
-if not labels_path.exists():
-    print(f"missing {labels_path}")
-else:
-    labels = pd.read_csv(labels_path, low_memory=False)
-    print(f"labels loaded: {len(labels):,} rows")
-    # check hasm_id match in both tables
+if labels is not None:
     hadm_ids_match = labels["hadm_id"].isin(snapshot["hadm_id"]).all()
-    # check dup (hadm_id, candidate_drug) pairs
     duplicate_pairs = labels.duplicated(["hadm_id", "candidate_drug"]).sum()
-    # is our negative sampling good
     pair_label_counts = labels.groupby(["hadm_id", "candidate_drug"])["label"].nunique()
     conflict_count = (pair_label_counts > 1).sum()
     print(f"all label hadm_id values exist in snapshot: {hadm_ids_match}")
@@ -75,10 +75,7 @@ print("RAW TABLES")
 print("=" * 60)
 
 # these are raw tables, before processing
-admissions = pd.read_csv(DATA_DIR / "admissions.csv", low_memory=False)
-patients = pd.read_csv(DATA_DIR / "patients.csv", low_memory=False)
-diagnoses = pd.read_csv(DATA_DIR / "diagnoses_icd.csv", low_memory=False)
-emar = pd.read_csv(DATA_DIR / "emar.csv", low_memory=False)
+admissions, patients, diagnoses, emar = load_raw_tables()
 
 # row counts
 print(f"admissions: {len(admissions):,} rows")
@@ -146,8 +143,6 @@ print("=" * 60)
 print("FEATURE TABLE")
 print("=" * 60)
 
-snapshot = pd.read_csv(snapshot_path, low_memory=False)
-
 # size after filtering to admissions with medications
 print(f"snapshot rows (admissions kept): {len(snapshot):,}")
 print(f"unique patients in snapshot: {snapshot['subject_id'].nunique():,}")
@@ -171,6 +166,20 @@ if "days_since_last_admission" in snapshot.columns:
     print("\ndays_since_last_admission (warm-start only):")
     gap_desc = gap.describe().round(1)
     print(gap_desc.to_string())
+
+# charlson
+if "charlson_comorbidity_index" in snapshot.columns:
+    cci = snapshot["charlson_comorbidity_index"]
+    print("\ncharlson_comorbidity_index:")
+    print(cci.describe().round(2).to_string())
+    print(f"admissions with charlson row: {cci.notna().sum():,} ({cci.notna().mean():.1%})")
+
+# services (last service)
+if "curr_service" in snapshot.columns:
+    svc = snapshot["curr_service"]
+    print(f"\ncurr_service coverage: {svc.notna().sum():,} ({svc.notna().mean():.1%})")
+    print("top services:")
+    print(svc.value_counts().head(10).to_string())
 
 # Three plots: age dist, prior-admission count (log y because heavy
 # tail), and the readmission gap distribution.
@@ -235,10 +244,9 @@ print("\n" + "=" * 60)
 print("Interaction Table")
 print("=" * 60)
 
-if not labels_path.exists():
+if labels is None:
     print(f"missing {labels_path}. Run prepare.py first. Skipping section 4.")
 else:
-    labels = pd.read_csv(labels_path, low_memory=False)
     n_labels = len(labels)
     n_pos = (labels["label"] == 1).sum()
     n_neg = (labels["label"] == 0).sum()
@@ -284,3 +292,33 @@ else:
     plt.savefig(OUT_DIR / "eda_labels.png", dpi=150)
     plt.close()
     print(f"\nsaved {OUT_DIR / 'eda_labels.png'}")
+
+
+# === Lab Matrices ===
+print("\n" + "=" * 60)
+print("Lab matrices")
+print("=" * 60)
+
+for source in LAB_SOURCES:
+    cur_path = PROCESSED_DIR / f"current_{source}_labs.npz"
+    pri_path = PROCESSED_DIR / f"prior_{source}_labs.npz"
+    if not cur_path.exists() or not pri_path.exists():
+        print(f"\n{source}: missing files, skipping")
+        continue
+
+    cur = np.load(cur_path)
+    pri = np.load(pri_path)
+    cur_vals = cur["values"]
+    cur_flags = cur["flags"]
+    pri_flags = pri["flags"]
+
+    n_rows, n_cols = cur_vals.shape
+    cur_coverage = (cur_flags.sum(axis=1) > 0).mean()
+    pri_coverage = (pri_flags.sum(axis=1) > 0).mean()
+    per_col_cur = cur_flags.mean(axis=0)
+
+    print(f"\n{source}: shape={cur_vals.shape}, cols={n_cols}")
+    print(f"  current: admissions with any measurement {cur_coverage:.1%}")
+    print(f"  prior:   admissions with any measurement {pri_coverage:.1%}")
+    print(f"  per-column measured rate (current): min={per_col_cur.min():.1%}, "
+          f"mean={per_col_cur.mean():.1%}, max={per_col_cur.max():.1%}")

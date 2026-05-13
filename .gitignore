@@ -1,10 +1,12 @@
-# Directories
+# folders
 docs/
 mimic_data/
 mimic_env/
+notes/
 outputs/
 scripts/
 
-# Non-Python/notebook files
+# parent level
 CLAUDE.md
+knowledge.md
 .DS_Store

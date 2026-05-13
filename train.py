@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import torch
@@ -9,12 +7,12 @@ from lightfm import LightFM
 from scipy.sparse import csr_matrix, hstack, load_npz
 from sklearn.metrics.pairwise import cosine_similarity
 
-PROCESSED_DIR = Path("mimic_data/processed")
+from config import PROCESSED_DIR, RANDOM_STATE, LAB_SOURCES
+
 K = 20
 KNN_NEIGHBORS = 50
 BATCH_SIZE = 500
 TEST_SIZE = 0.20
-RANDOM_STATE = 42
 BPR_FACTORS = 64  # latent factors for BPR
 BPR_EPOCHS = 10
 BPR_LR = 0.03
@@ -85,20 +83,50 @@ def ndcg_at_k(preds, true_drugs):
 
 # for the feature table
 def build_dense_feature_matrix(features):
-    drop_cols = ["subject_id", "hadm_id", "admittime", "edregtime", "edouttime"]
+    drop_cols = ["subject_id", "hadm_id", "admittime"]
     dense = features.drop(columns=drop_cols, errors="ignore")
     dense = pd.get_dummies(dense, dummy_na=True).fillna(0)
     return csr_matrix(dense.to_numpy(dtype=np.float32))
 
 
+# fill missing values with median of train
+def impute_labs(values, train_rows):
+    out = values.copy()
+    medians = np.nanmedian(values[train_rows], axis=0)
+    medians = np.where(np.isnan(medians), 0.0, medians)
+    for j in range(out.shape[1]):
+        mask = np.isnan(out[:, j])
+        out[mask, j] = medians[j]
+    return out
+
+
+def load_lab_source(source, train_rows):
+    cur = np.load(PROCESSED_DIR / f"current_{source}_labs.npz")
+    pri = np.load(PROCESSED_DIR / f"prior_{source}_labs.npz")
+
+    cur_vals = impute_labs(cur["values"], train_rows)
+    pri_vals = impute_labs(pri["values"], train_rows)
+    cur_flags = cur["flags"]
+    pri_flags = pri["flags"]
+
+    block = np.concatenate([cur_vals, cur_flags, pri_vals, pri_flags], axis=1)
+    return csr_matrix(block.astype(np.float32))
+
+
 # add in the dense matrices
-def build_full_feature_matrix(features):
+def build_full_feature_matrix(features, train_rows):
     current_dx = load_npz(PROCESSED_DIR / "current_dx_matrix.npz")
     prior_dx = load_npz(PROCESSED_DIR / "prior_dx_matrix.npz")
     prior_med = load_npz(PROCESSED_DIR / "prior_med_matrix.npz")
+    current_proc = load_npz(PROCESSED_DIR / "current_proc_matrix.npz")
+    prior_proc = load_npz(PROCESSED_DIR / "prior_proc_matrix.npz")
     dense_features = build_dense_feature_matrix(features)
 
-    return hstack([current_dx, prior_dx, prior_med, dense_features], format="csr")
+    blocks = [current_dx, prior_dx, prior_med, current_proc, prior_proc, dense_features]
+    for source in LAB_SOURCES:
+        blocks.append(load_lab_source(source, train_rows))
+
+    return hstack(blocks, format="csr")
 
 
 features = pd.read_csv(
@@ -145,7 +173,7 @@ test_rows = np.array(te_rows)
 train_hadm = hadm_ids[train_rows]
 test_hadm = hadm_ids[test_rows]
 
-feature_matrix = build_full_feature_matrix(features)
+feature_matrix = build_full_feature_matrix(features, train_rows)
 med_vocab = np.array(sorted(train_interactions["medication"].unique()))
 med_to_col = {m: i for i, m in enumerate(med_vocab)}
 med_ids = np.arange(len(med_vocab), dtype=np.int32)
