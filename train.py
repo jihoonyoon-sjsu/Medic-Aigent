@@ -1,13 +1,21 @@
+import pickle
+
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from implicit.bpr import BayesianPersonalizedRanking
 from lightgbm import LGBMRanker
 from lightfm import LightFM
 from scipy.sparse import csr_matrix, hstack, load_npz
 from sklearn.metrics.pairwise import cosine_similarity
 
 from config import PROCESSED_DIR, RANDOM_STATE, LAB_SOURCES
+
+MODELS_DIR = PROCESSED_DIR.parent / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+TOP_N_SAVED = 100
+metrics = {}
 
 K = 20
 KNN_NEIGHBORS = 50
@@ -24,7 +32,7 @@ DEEPFM_FACTORS = 32
 DEEPFM_EPOCHS = 5
 DEEPFM_LR = 0.001
 DEEPFM_BATCH_SIZE = 512
-DEEPFM_PRED_BATCH = 10
+DEEPFM_PRED_BATCH = 512
 
 
 # split by patient, so that same patient doesn't show up in train and test
@@ -161,15 +169,8 @@ print(f"test admissions: {len(test_ids):,}")
 hadm_ids = features["hadm_id"].to_numpy()
 hadm_to_row = {h: i for i, h in enumerate(hadm_ids)}
 
-tr_rows, te_rows = [], []
-for i, h in enumerate(hadm_ids):
-    if h in train_ids:
-        tr_rows.append(i)
-    elif h in test_ids:
-        te_rows.append(i)
-
-train_rows = np.array(tr_rows)
-test_rows = np.array(te_rows)
+train_rows = np.where(features["hadm_id"].isin(train_ids).to_numpy())[0]
+test_rows = np.where(features["hadm_id"].isin(test_ids).to_numpy())[0]
 train_hadm = hadm_ids[train_rows]
 test_hadm = hadm_ids[test_rows]
 
@@ -186,6 +187,7 @@ popularity_preds = {}
 for hadm_id in ground_truth:
     popularity_preds[hadm_id] = top_meds
 p, r, n = evaluate(popularity_preds, ground_truth)
+metrics["popularity"] = (p, r, n)
 print(f"\npopularity -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 
 
@@ -219,62 +221,13 @@ for start in range(0, len(test_rows), BATCH_SIZE):
         knn_preds[hadm_id] = sorted(drug_scores, key=drug_scores.get, reverse=True)
 
 p, r, n = evaluate(knn_preds, ground_truth)
+metrics["knn"] = (p, r, n)
 print(
     f"full-feature KNN -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}"
 )
 
 
 # ========== MODEL 3: BPR ==========
-def train_bpr(interaction_matrix):
-    rng = np.random.default_rng(RANDOM_STATE)
-    num_users, num_items = interaction_matrix.shape
-
-    # BPR - baysian personalized ranking
-    # initialize random initial weights
-    # shape is num (users/items, 64)
-    users = rng.normal(0, 0.05, size=(num_users, BPR_FACTORS)).astype(np.float32)
-    meds = rng.normal(0, 0.05, size=(num_items, BPR_FACTORS)).astype(np.float32)
-
-    meds_by_user = []
-    train_users = []
-    for u in range(num_users):
-        # get all medications per user (med ids received)
-        user_meds = interaction_matrix[u].indices
-        meds_by_user.append(user_meds)
-        # add to train users if they some meds
-        if len(user_meds) > 0 and len(user_meds) < num_items:
-            train_users.append(u)
-
-    if len(train_users) == 0:
-        return meds
-
-    n_samples = len(train_users) * 20
-    for _ in range(BPR_EPOCHS):
-        for _ in range(n_samples):
-            u = rng.choice(train_users)
-            user_meds = meds_by_user[u]
-
-            pos = rng.choice(user_meds)
-            neg = rng.integers(num_items)
-            while neg in user_meds:
-                neg = rng.integers(num_items)
-
-            # (u, pos, neg) we are training on
-            u_vec = users[u].copy()
-            p_vec = meds[pos].copy()
-            n_vec = meds[neg].copy()
-
-            # we want this to be big
-            diff = u_vec @ (p_vec - n_vec)
-            w = 1.0 / (1.0 + np.exp(diff))
-
-            users[u] += BPR_LR * (w * (p_vec - n_vec) - BPR_REG * u_vec)
-            meds[pos] += BPR_LR * (w * u_vec - BPR_REG * p_vec)
-            meds[neg] += BPR_LR * (-w * u_vec - BPR_REG * n_vec)
-
-    return meds
-
-
 # all users/subjects in train
 train_subject_ids = np.sort(
     features.loc[train_rows, "subject_id"].drop_duplicates().to_numpy()
@@ -299,8 +252,15 @@ train_patient_item_matrix = csr_matrix(
 )
 
 print("Training BPR-MF baseline...")
-# one learned vector per med
-bpr_med_factors = train_bpr(train_patient_item_matrix)
+bpr_model = BayesianPersonalizedRanking(
+    factors=BPR_FACTORS,
+    learning_rate=BPR_LR,
+    regularization=BPR_REG,
+    iterations=BPR_EPOCHS,
+    random_state=RANDOM_STATE,
+)
+bpr_model.fit(train_patient_item_matrix)
+bpr_med_factors = bpr_model.item_factors
 # uses prior med list to predict new medications
 prior_med_matrix = load_npz(PROCESSED_DIR / "prior_med_matrix.npz")
 all_prior_meds = np.array(sorted(interactions["medication"].unique()))
@@ -332,6 +292,7 @@ for row_idx, hadm_id in zip(test_rows, test_hadm):
     bpr_preds[hadm_id] = med_vocab[np.argsort(scores)[::-1]].tolist()
 
 p, r, n = evaluate(bpr_preds, ground_truth)
+metrics["bpr"] = (p, r, n)
 print(f"BPR-MF -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 print(
     f"BPR-MF warm-start admissions in test: {warm_start_count:,} / {len(test_hadm):,}"
@@ -388,6 +349,7 @@ for start in range(0, len(test_rows), BATCH_SIZE):
         lightfm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(lightfm_preds, ground_truth)
+metrics["lightfm"] = (p, r, n)
 print(f"LightFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 
 
@@ -457,6 +419,7 @@ for start in range(0, len(test_rows), LGBM_BATCH_SIZE):
         lgbm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(lgbm_preds, ground_truth)
+metrics["lgbm"] = (p, r, n)
 print(f"LightGBM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 
 
@@ -580,7 +543,28 @@ for start in range(0, len(test_rows), DEEPFM_PRED_BATCH):
         deepfm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(deepfm_preds, ground_truth)
+metrics["deepfm"] = (p, r, n)
 print(f"DeepFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+
+# savemodels for front end
+artifacts = {
+    "predictions": {
+        "popularity": {h: list(v)[:TOP_N_SAVED] for h, v in popularity_preds.items()},
+        "knn": {h: list(v)[:TOP_N_SAVED] for h, v in knn_preds.items()},
+        "bpr": {h: list(v)[:TOP_N_SAVED] for h, v in bpr_preds.items()},
+        "lightfm": {h: list(v)[:TOP_N_SAVED] for h, v in lightfm_preds.items()},
+        "lgbm": {h: list(v)[:TOP_N_SAVED] for h, v in lgbm_preds.items()},
+        "deepfm": {h: list(v)[:TOP_N_SAVED] for h, v in deepfm_preds.items()},
+    },
+    "metrics": metrics,
+    "ground_truth": ground_truth,
+    "train_ids": train_ids,
+    "test_ids": test_ids,
+}
+
+with open(MODELS_DIR / "artifacts.pkl", "wb") as f:
+    pickle.dump(artifacts, f)
+print(f"\nSaved artifacts to {MODELS_DIR / 'artifacts.pkl'}")
 
 
 # ========== MODEL 7: etc - sequential? mixed/hybrid? ==========
