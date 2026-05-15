@@ -224,6 +224,12 @@ def make_label_table(snapshot, interactions):
 
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
+existing_metadata = {}
+metadata_path = PROCESSED_DIR / "feature_metadata.json"
+if metadata_path.exists():
+    with open(metadata_path) as fp:
+        existing_metadata = json.load(fp)
+
 print("loading raw tables...")
 admissions, patients, diagnoses, emar = load_raw_tables()
 procedures = pd.read_csv(DATA_DIR / "procedures_icd.csv", low_memory=False)
@@ -308,33 +314,67 @@ patient_admission_snapshot = patient_admission_snapshot.merge(
 print("building lab matrices...")
 lab_cols_by_source = {}
 for source in LAB_SOURCES:
+    cur_path = PROCESSED_DIR / f"current_{source}_labs.npz"
+    pri_path = PROCESSED_DIR / f"prior_{source}_labs.npz"
+    cached_cols = existing_metadata.get("lab_sources", {}).get(source)
+    if cur_path.exists() and pri_path.exists() and cached_cols is not None:
+        print(f"  {source} already exists. skipping.")
+        lab_cols_by_source[source] = cached_cols
+        continue
     print(f"  {source}...")
     current_v, current_f, lab_cols = build_current_labs(snapshot, source)
     prior_v, prior_f = compute_prior_labs(snapshot, current_v, current_f)
-    np.savez_compressed(
-        PROCESSED_DIR / f"current_{source}_labs.npz", values=current_v, flags=current_f
-    )
-    np.savez_compressed(
-        PROCESSED_DIR / f"prior_{source}_labs.npz", values=prior_v, flags=prior_f
-    )
+    np.savez_compressed(cur_path, values=current_v, flags=current_f)
+    np.savez_compressed(pri_path, values=prior_v, flags=prior_f)
     lab_cols_by_source[source] = lab_cols
 
-print("making label table...")
-admission_drug_labels = make_label_table(snapshot, interactions)
-print("label rows:", len(admission_drug_labels))
+label_path = PROCESSED_DIR / "admission_drug_labels.csv"
+if label_path.exists():
+    print(f"{label_path.name} already exists. skipping.")
+else:
+    print("making label table...")
+    admission_drug_labels = make_label_table(snapshot, interactions)
+    print("label rows:", len(admission_drug_labels))
+    admission_drug_labels.to_csv(label_path, index=False)
 
 
 # save everything
 
-patient_admission_snapshot.to_csv(
-    PROCESSED_DIR / "patient_admission_snapshot.csv", index=False
-)
-admission_drug_labels.to_csv(PROCESSED_DIR / "admission_drug_labels.csv", index=False)
-save_npz(PROCESSED_DIR / "current_dx_matrix.npz", current_dx_matrix)
-save_npz(PROCESSED_DIR / "prior_dx_matrix.npz", prior_dx_matrix)
-save_npz(PROCESSED_DIR / "prior_med_matrix.npz", prior_med_matrix)
-save_npz(PROCESSED_DIR / "current_proc_matrix.npz", current_proc_matrix)
-save_npz(PROCESSED_DIR / "prior_proc_matrix.npz", prior_proc_matrix)
+path = PROCESSED_DIR / "patient_admission_snapshot.csv"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    patient_admission_snapshot.to_csv(path, index=False)
+
+path = PROCESSED_DIR / "current_dx_matrix.npz"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    save_npz(path, current_dx_matrix)
+
+path = PROCESSED_DIR / "prior_dx_matrix.npz"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    save_npz(path, prior_dx_matrix)
+
+path = PROCESSED_DIR / "prior_med_matrix.npz"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    save_npz(path, prior_med_matrix)
+
+path = PROCESSED_DIR / "current_proc_matrix.npz"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    save_npz(path, current_proc_matrix)
+
+path = PROCESSED_DIR / "prior_proc_matrix.npz"
+if path.exists():
+    print(f"{path.name} already exists. skipping.")
+else:
+    save_npz(path, prior_proc_matrix)
 
 charlson_cols = [c for c in charlson.columns if c != "hadm_id"]
 metadata = {
@@ -346,8 +386,11 @@ metadata = {
     "negatives_per_admission": NEGATIVES_PER_ADMISSION,
     "random_state": RANDOM_STATE,
 }
-with open(PROCESSED_DIR / "feature_metadata.json", "w") as fp:
-    json.dump(metadata, fp, indent=2)
+if metadata_path.exists():
+    print(f"{metadata_path.name} already exists. skipping.")
+else:
+    with open(metadata_path, "w") as fp:
+        json.dump(metadata, fp, indent=2)
 
 print("done")
 
