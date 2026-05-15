@@ -1,14 +1,19 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "4"
+
 import pickle
+import time as _time
 
 import numpy as np
 import pandas as pd
-import torch
-from torch import nn
 from implicit.bpr import BayesianPersonalizedRanking
 from lightgbm import LGBMRanker
 from lightfm import LightFM
-from scipy.sparse import csr_matrix, hstack, load_npz
+from scipy.sparse import csr_matrix, diags, hstack, load_npz
+from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MaxAbsScaler
 
 from config import PROCESSED_DIR, RANDOM_STATE, LAB_SOURCES
 
@@ -28,6 +33,7 @@ BPR_REG = 0.01
 LIGHTFM_FACTORS = 64
 LIGHTFM_EPOCHS = 10
 LGBM_BATCH_SIZE = 50
+KNN_SVD_COMPONENTS = 256
 DEEPFM_FACTORS = 32
 DEEPFM_EPOCHS = 5
 DEEPFM_LR = 0.001
@@ -121,18 +127,30 @@ def load_lab_source(source, train_rows):
     return csr_matrix(block.astype(np.float32))
 
 
+# normalize and scale
+def field_normalize(mat):
+    nnz = np.diff(mat.indptr).astype(np.float32)
+    nnz[nnz == 0] = 1.0
+    return (diags(1.0 / nnz) @ mat).astype(np.float32)
+
+def scale_train_fit(mat, train_rows):
+    scaler = MaxAbsScaler()
+    scaler.fit(mat[train_rows])
+    return scaler.transform(mat).astype(np.float32)
+
+
 # add in the dense matrices
 def build_full_feature_matrix(features, train_rows):
-    current_dx = load_npz(PROCESSED_DIR / "current_dx_matrix.npz")
-    prior_dx = load_npz(PROCESSED_DIR / "prior_dx_matrix.npz")
-    prior_med = load_npz(PROCESSED_DIR / "prior_med_matrix.npz")
-    current_proc = load_npz(PROCESSED_DIR / "current_proc_matrix.npz")
-    prior_proc = load_npz(PROCESSED_DIR / "prior_proc_matrix.npz")
-    dense_features = build_dense_feature_matrix(features)
+    current_dx = field_normalize(load_npz(PROCESSED_DIR / "current_dx_matrix.npz"))
+    prior_dx = field_normalize(load_npz(PROCESSED_DIR / "prior_dx_matrix.npz"))
+    prior_med = field_normalize(load_npz(PROCESSED_DIR / "prior_med_matrix.npz"))
+    current_proc = field_normalize(load_npz(PROCESSED_DIR / "current_proc_matrix.npz"))
+    prior_proc = field_normalize(load_npz(PROCESSED_DIR / "prior_proc_matrix.npz"))
+    dense_features = scale_train_fit(build_dense_feature_matrix(features), train_rows)
 
     blocks = [current_dx, prior_dx, prior_med, current_proc, prior_proc, dense_features]
     for source in LAB_SOURCES:
-        blocks.append(load_lab_source(source, train_rows))
+        blocks.append(scale_train_fit(load_lab_source(source, train_rows), train_rows))
 
     return hstack(blocks, format="csr")
 
@@ -191,40 +209,54 @@ metrics["popularity"] = (p, r, n)
 print(f"\npopularity -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
 
 
-# ========== MODEL 2: KNN ==========
-print("Building full-feature KNN baseline...")
+# ========== MODEL 2: KNN/SVD ==========
+_t0 = _time.time(); print("Building full-feature KNN baseline...")
 train_features = feature_matrix[train_rows]
 test_features = feature_matrix[test_rows]
+
+svd = TruncatedSVD(n_components=KNN_SVD_COMPONENTS, random_state=RANDOM_STATE)
+train_features_reduced = svd.fit_transform(train_features)
+test_features_reduced = svd.transform(test_features)
 
 train_drugs_by_hadm = {}
 for hadm_id, grp in train_interactions.groupby("hadm_id"):
     train_drugs_by_hadm[hadm_id] = list(grp["medication"])
 
+_drug_rows, _drug_cols = [], []
+for pos, h in enumerate(train_hadm):
+    for drug in train_drugs_by_hadm.get(h, []):
+        c = med_to_col.get(drug)
+        if c is not None:
+            _drug_rows.append(pos)
+            _drug_cols.append(c)
+train_drug_matrix = csr_matrix(
+    (np.ones(len(_drug_rows), dtype=np.float32), (_drug_rows, _drug_cols)),
+    shape=(len(train_rows), n_meds),
+)
+
 knn_preds = {}
 for start in range(0, len(test_rows), BATCH_SIZE):
-    batch = test_features[start : start + BATCH_SIZE]
-    sims = cosine_similarity(batch, train_features)
+    batch = test_features_reduced[start : start + BATCH_SIZE]
+    sims = cosine_similarity(batch, train_features_reduced)
 
     for i, row_sims in enumerate(sims):
         hadm_id = test_hadm[start + i]
-        neighbor_rows = np.argsort(row_sims)[::-1][:KNN_NEIGHBORS]
+        top_idx = np.argpartition(row_sims, -KNN_NEIGHBORS)[-KNN_NEIGHBORS:]
+        top_sims = row_sims[top_idx]
+        pos_mask = top_sims > 0
+        top_idx = top_idx[pos_mask]
+        top_sims = top_sims[pos_mask]
 
-        drug_scores = {}
-        for nr in neighbor_rows:
-            s = row_sims[nr]
-            if s <= 0:
-                continue
-            n_hadm = train_hadm[nr]
-            for drug in train_drugs_by_hadm.get(n_hadm, []):
-                drug_scores[drug] = drug_scores.get(drug, 0) + s
+        if len(top_idx) == 0:
+            knn_preds[hadm_id] = top_meds
+            continue
 
-        knn_preds[hadm_id] = sorted(drug_scores, key=drug_scores.get, reverse=True)
+        drug_scores = np.asarray(top_sims @ train_drug_matrix[top_idx]).ravel()
+        knn_preds[hadm_id] = med_vocab[np.argsort(drug_scores)[::-1]].tolist()
 
 p, r, n = evaluate(knn_preds, ground_truth)
 metrics["knn"] = (p, r, n)
-print(
-    f"full-feature KNN -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}"
-)
+print(f"full-feature KNN -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
 
 
 # ========== MODEL 3: BPR ==========
@@ -251,7 +283,7 @@ train_patient_item_matrix = csr_matrix(
     shape=(len(train_subject_ids), len(med_vocab)),
 )
 
-print("Training BPR-MF baseline...")
+_t0 = _time.time(); print("Training BPR-MF baseline...")
 bpr_model = BayesianPersonalizedRanking(
     factors=BPR_FACTORS,
     learning_rate=BPR_LR,
@@ -293,7 +325,7 @@ for row_idx, hadm_id in zip(test_rows, test_hadm):
 
 p, r, n = evaluate(bpr_preds, ground_truth)
 metrics["bpr"] = (p, r, n)
-print(f"BPR-MF -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+print(f"BPR-MF -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
 print(
     f"BPR-MF warm-start admissions in test: {warm_start_count:,} / {len(test_hadm):,}"
 )
@@ -319,16 +351,18 @@ lightfm_interactions = csr_matrix(
     shape=(len(features), len(med_vocab)),
 )
 
-print("Training LightFM baseline...")
-# loss is warp loss - good for implicit feedbakc and for ranking.
+# scaled, normalized features
+lightfm_user_features = feature_matrix
+
+_t0 = _time.time(); print("Training LightFM baseline...")
 lightfm_model = LightFM(
-    no_components=LIGHTFM_FACTORS,  # 64 as before
+    no_components=LIGHTFM_FACTORS,
     loss="warp",
     random_state=RANDOM_STATE,
 )
 lightfm_model.fit(
     lightfm_interactions,
-    user_features=feature_matrix,  # our feature matrix from prepare.py
+    user_features=lightfm_user_features,
     epochs=LIGHTFM_EPOCHS,
 )
 
@@ -340,7 +374,7 @@ for start in range(0, len(test_rows), BATCH_SIZE):
     user_ids = np.repeat(batch_rows, n_meds)
     item_ids = np.tile(med_ids, len(batch_rows))
 
-    scores = lightfm_model.predict(user_ids, item_ids, user_features=feature_matrix)
+    scores = lightfm_model.predict(user_ids, item_ids, user_features=lightfm_user_features)
     scores = scores.reshape(len(batch_rows), n_meds)
 
     for i, hadm_id in enumerate(batch_hadm):
@@ -350,7 +384,7 @@ for start in range(0, len(test_rows), BATCH_SIZE):
 
 p, r, n = evaluate(lightfm_preds, ground_truth)
 metrics["lightfm"] = (p, r, n)
-print(f"LightFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+print(f"LightFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
 
 
 # ========== MODEL 5: LightGBM ==========
@@ -375,8 +409,9 @@ lgbm_drugs = csr_matrix(
     shape=(len(lgbm_train), n_meds),
 )
 lgbm_x = hstack([feature_matrix[lgbm_rows], lgbm_drugs], format="csr")
+lgbm_x.sort_indices()
 
-print("Training LightGBM LambdaRank model...")
+_t0 = _time.time(); print("Training LightGBM LambdaRank model...")
 lgbm_model = LGBMRanker(
     n_estimators=100,
     learning_rate=0.05,
@@ -385,7 +420,7 @@ lgbm_model = LGBMRanker(
     label_gain=[0, 1],
     eval_at=[K],
     random_state=RANDOM_STATE,
-    n_jobs=-1,
+    n_jobs=4,
     verbose=-1,
 )
 lgbm_model.fit(lgbm_x, lgbm_y, group=lgbm_group)
@@ -420,10 +455,14 @@ for start in range(0, len(test_rows), LGBM_BATCH_SIZE):
 
 p, r, n = evaluate(lgbm_preds, ground_truth)
 metrics["lgbm"] = (p, r, n)
-print(f"LightGBM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+print(f"LightGBM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
 
 
 # ========== MODEL 6: DeepFM ==========
+# need to import here because of conflicts
+import torch
+from torch import nn
+
 # deep learning approach
 # takes input and outputs three components: linear/fm/deep parts
 # it's like logistic regression + lightFM + MLP
@@ -510,7 +549,7 @@ def predict_deepfm(model, x):
         return model(idx, offsets, vals).numpy()
 
 
-print("Training DeepFM model...")
+_t0 = _time.time(); print("Training DeepFM model...")
 # same input shape as LightGBM: admission features to one hot drugs
 deepfm_train = labels[labels["hadm_id"].isin(train_ids)].copy()
 deepfm_train = deepfm_train[deepfm_train["candidate_drug"].isin(med_to_col)]
@@ -544,7 +583,7 @@ for start in range(0, len(test_rows), DEEPFM_PRED_BATCH):
 
 p, r, n = evaluate(deepfm_preds, ground_truth)
 metrics["deepfm"] = (p, r, n)
-print(f"DeepFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+print(f"DeepFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
 
 # savemodels for front end
 artifacts = {
