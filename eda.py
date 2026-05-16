@@ -1,12 +1,11 @@
 from pathlib import Path
-import json
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.sparse import load_npz
 
-from config import DATA_DIR, PROCESSED_DIR, LAB_SOURCES, load_raw_tables
+from config import PROCESSED_DIR, LAB_SOURCES, load_raw_tables
 
 OUT_DIR = Path("outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -161,25 +160,22 @@ pct = first_visit / len(snapshot)
 print(f"first-visit (cold-start) admissions: {first_visit:,} ({pct:.1%})")
 
 # days between this and the most recent last admission
-if "days_since_last_admission" in snapshot.columns:
-    gap = snapshot["days_since_last_admission"].dropna()
-    print("\ndays_since_last_admission (warm-start only):")
-    gap_desc = gap.describe().round(1)
-    print(gap_desc.to_string())
+gap = snapshot["days_since_last_admission"].dropna()
+print("\ndays_since_last_admission (warm-start only):")
+gap_desc = gap.describe().round(1)
+print(gap_desc.to_string())
 
 # charlson
-if "charlson_comorbidity_index" in snapshot.columns:
-    cci = snapshot["charlson_comorbidity_index"]
-    print("\ncharlson_comorbidity_index:")
-    print(cci.describe().round(2).to_string())
-    print(f"admissions with charlson row: {cci.notna().sum():,} ({cci.notna().mean():.1%})")
+cci = snapshot["charlson_comorbidity_index"]
+print("\ncharlson_comorbidity_index:")
+print(cci.describe().round(2).to_string())
+print(f"admissions with charlson row: {cci.notna().sum():,} ({cci.notna().mean():.1%})")
 
 # services (last service)
-if "curr_service" in snapshot.columns:
-    svc = snapshot["curr_service"]
-    print(f"\ncurr_service coverage: {svc.notna().sum():,} ({svc.notna().mean():.1%})")
-    print("top services:")
-    print(svc.value_counts().head(10).to_string())
+svc = snapshot["curr_service"]
+print(f"\ncurr_service coverage: {svc.notna().sum():,} ({svc.notna().mean():.1%})")
+print("top services:")
+print(svc.value_counts().head(10).to_string())
 
 # Three plots: age dist, prior-admission count (log y because heavy
 # tail), and the readmission gap distribution.
@@ -196,16 +192,15 @@ axes[1].set_xlabel("prior admissions")
 axes[1].set_ylabel("admissions")
 axes[1].set_yscale("log")
 
-if "days_since_last_admission" in snapshot.columns:
-    axes[2].hist(
-        snapshot["days_since_last_admission"].dropna(),
-        bins=50,
-        edgecolor="white",
-    )
-    axes[2].set_title("days since last admission")
-    axes[2].set_xlabel("days")
-    axes[2].set_ylabel("admissions")
-    axes[2].set_yscale("log")
+axes[2].hist(
+    snapshot["days_since_last_admission"].dropna(),
+    bins=50,
+    edgecolor="white",
+)
+axes[2].set_title("days since last admission")
+axes[2].set_xlabel("days")
+axes[2].set_ylabel("admissions")
+axes[2].set_yscale("log")
 
 plt.tight_layout()
 plt.savefig(OUT_DIR / "eda_snapshot.png", dpi=150)
@@ -266,8 +261,7 @@ else:
     # most popular drugs
     drug_popularity = positives["candidate_drug"].value_counts()
     print("\ntop 20 drugs by admissions administered:")
-    top20_full = drug_popularity.head(20)
-    print(top20_full.to_string())
+    print(drug_popularity.head(20).to_string())
 
     # what share of administrations are from the popular drugs
     # higher means stronger popularity bias, which means it may be harder to beat.
@@ -312,7 +306,7 @@ for source in LAB_SOURCES:
     cur_flags = cur["flags"]
     pri_flags = pri["flags"]
 
-    n_rows, n_cols = cur_vals.shape
+    n_cols = cur_vals.shape[1]
     cur_coverage = (cur_flags.sum(axis=1) > 0).mean()
     pri_coverage = (pri_flags.sum(axis=1) > 0).mean()
     per_col_cur = cur_flags.mean(axis=0)

@@ -1,62 +1,47 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "4"
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "8"
+
+import time
 import pickle
-import time as _time
 
 import numpy as np
 import pandas as pd
-from implicit.bpr import BayesianPersonalizedRanking
-from lightgbm import LGBMRanker
-from lightfm import LightFM
 from scipy.sparse import csr_matrix, diags, hstack, load_npz
-from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MaxAbsScaler
 
+from lightgbm import LGBMRanker, early_stopping, log_evaluation
+from lightfm import LightFM
+from implicit.als import AlternatingLeastSquares
+
 from config import PROCESSED_DIR, RANDOM_STATE, LAB_SOURCES
+
+
+K = 20
+TEST_SIZE = 0.20
+TOP_N_SAVED = 100
 
 MODELS_DIR = PROCESSED_DIR.parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
-TOP_N_SAVED = 100
-metrics = {}
-
-K = 20
-KNN_NEIGHBORS = 50
-BATCH_SIZE = 500
-TEST_SIZE = 0.20
-BPR_FACTORS = 64  # latent factors for BPR
-BPR_EPOCHS = 10
-BPR_LR = 0.03
-BPR_REG = 0.01
-LIGHTFM_FACTORS = 64
-LIGHTFM_EPOCHS = 10
-LGBM_BATCH_SIZE = 50
-KNN_SVD_COMPONENTS = 256
-DEEPFM_FACTORS = 32
-DEEPFM_EPOCHS = 5
-DEEPFM_LR = 0.001
-DEEPFM_BATCH_SIZE = 512
-DEEPFM_PRED_BATCH = 512
+ARTIFACTS_PATH = MODELS_DIR / "artifacts.pkl"
 
 
 # split by patient, so that same patient doesn't show up in train and test
 # this would cause leakage, so that all history stays on one side
 def split_by_patient(features):
     rng = np.random.default_rng(RANDOM_STATE)
-    subject_ids = features["subject_id"].drop_duplicates().to_numpy().copy()
-    rng.shuffle(subject_ids)
+    subjects = features["subject_id"].drop_duplicates().to_numpy().copy()
+    rng.shuffle(subjects)
 
-    n_test = int(len(subject_ids) * TEST_SIZE)
-    test_subjects = set(subject_ids[:n_test].tolist())
-    train_subjects = set(subject_ids[n_test:].tolist())
+    n_test = int(len(subjects) * TEST_SIZE)
+    test_subjects = set(subjects[:n_test].tolist())
+    train_subjects = set(subjects[n_test:].tolist())
 
-    train_mask = features["subject_id"].isin(train_subjects)
-    test_mask = features["subject_id"].isin(test_subjects)
-    return set(features.loc[train_mask, "hadm_id"]), set(
-        features.loc[test_mask, "hadm_id"]
-    )
+    train_hadm_ids = features.loc[features["subject_id"].isin(train_subjects), "hadm_id"]
+    test_hadm_ids = features.loc[features["subject_id"].isin(test_subjects), "hadm_id"]
+    return set(train_hadm_ids), set(test_hadm_ids)
 
 
 # precision@k, recall@k, and ndcg@k
@@ -84,11 +69,11 @@ def ndcg_at_k(preds, true_drugs):
     dcg = 0.0
     for i, drug in enumerate(preds):
         if drug in true_drugs:
-            dcg += 1 / np.log2(i + 2)
+            dcg += 1.0 / np.log2(i + 2)
 
     # ideal is if our order is all right
     ideal_hits = min(len(true_drugs), K)
-    ideal_dcg = sum(1 / np.log2(r + 1) for r in range(1, ideal_hits + 1))
+    ideal_dcg = sum(1.0 / np.log2(r + 1) for r in range(1, ideal_hits + 1))
 
     if ideal_dcg == 0:
         return 0.0
@@ -115,15 +100,14 @@ def impute_labs(values, train_rows):
 
 
 def load_lab_source(source, train_rows):
-    cur = np.load(PROCESSED_DIR / f"current_{source}_labs.npz")
-    pri = np.load(PROCESSED_DIR / f"prior_{source}_labs.npz")
+    current = np.load(PROCESSED_DIR / f"current_{source}_labs.npz")
+    prior = np.load(PROCESSED_DIR / f"prior_{source}_labs.npz")
 
-    cur_vals = impute_labs(cur["values"], train_rows)
-    pri_vals = impute_labs(pri["values"], train_rows)
-    cur_flags = cur["flags"]
-    pri_flags = pri["flags"]
-
-    block = np.concatenate([cur_vals, cur_flags, pri_vals, pri_flags], axis=1)
+    current_values = impute_labs(current["values"], train_rows)
+    prior_values = impute_labs(prior["values"], train_rows)
+    block = np.concatenate(
+        [current_values, current["flags"], prior_values, prior["flags"]], axis=1
+    )
     return csr_matrix(block.astype(np.float32))
 
 
@@ -132,6 +116,7 @@ def field_normalize(mat):
     nnz = np.diff(mat.indptr).astype(np.float32)
     nnz[nnz == 0] = 1.0
     return (diags(1.0 / nnz) @ mat).astype(np.float32)
+
 
 def scale_train_fit(mat, train_rows):
     scaler = MaxAbsScaler()
@@ -146,19 +131,20 @@ def build_full_feature_matrix(features, train_rows):
     prior_med = field_normalize(load_npz(PROCESSED_DIR / "prior_med_matrix.npz"))
     current_proc = field_normalize(load_npz(PROCESSED_DIR / "current_proc_matrix.npz"))
     prior_proc = field_normalize(load_npz(PROCESSED_DIR / "prior_proc_matrix.npz"))
-    dense_features = scale_train_fit(build_dense_feature_matrix(features), train_rows)
+    dense = scale_train_fit(build_dense_feature_matrix(features), train_rows)
 
-    blocks = [current_dx, prior_dx, prior_med, current_proc, prior_proc, dense_features]
+    blocks = [current_dx, prior_dx, prior_med, current_proc, prior_proc, dense]
     for source in LAB_SOURCES:
         blocks.append(scale_train_fit(load_lab_source(source, train_rows), train_rows))
-
     return hstack(blocks, format="csr")
 
 
-features = pd.read_csv(
-    PROCESSED_DIR / "patient_admission_snapshot.csv", low_memory=False
-)
+metrics = {}
+all_preds = {}
 
+
+print("loading processed tables...")
+features = pd.read_csv(PROCESSED_DIR / "patient_admission_snapshot.csv", low_memory=False)
 labels = pd.read_csv(PROCESSED_DIR / "admission_drug_labels.csv", low_memory=False)
 
 # handle type
@@ -166,8 +152,7 @@ features["admittime"] = pd.to_datetime(features["admittime"])
 features["hadm_id"] = features["hadm_id"].astype(int)
 labels["hadm_id"] = labels["hadm_id"].astype(int)
 
-positive_labels = labels[labels["label"] == 1]
-interactions = positive_labels.rename(columns={"candidate_drug": "medication"})
+interactions = labels[labels["label"] == 1].rename(columns={"candidate_drug": "medication"})
 
 train_ids, test_ids = split_by_patient(features)
 
@@ -180,9 +165,7 @@ for hadm_id, grp in test_interactions.groupby("hadm_id"):
 
 top_meds = train_interactions["medication"].value_counts().index.tolist()
 
-print("loaded %d admissions" % len(features))
-print(f"train admissions: {len(train_ids):,}")
-print(f"test admissions: {len(test_ids):,}")
+print("admissions:", len(features), "train:", len(train_ids), "test:", len(test_ids))
 
 hadm_ids = features["hadm_id"].to_numpy()
 hadm_to_row = {h: i for i, h in enumerate(hadm_ids)}
@@ -192,52 +175,89 @@ test_rows = np.where(features["hadm_id"].isin(test_ids).to_numpy())[0]
 train_hadm = hadm_ids[train_rows]
 test_hadm = hadm_ids[test_rows]
 
+print("building feature matrix...")
 feature_matrix = build_full_feature_matrix(features, train_rows)
+feature_matrix.indptr = feature_matrix.indptr.astype(np.int64)
+feature_matrix.indices = feature_matrix.indices.astype(np.int64)
+
 med_vocab = np.array(sorted(train_interactions["medication"].unique()))
-med_to_col = {m: i for i, m in enumerate(med_vocab)}
+med_to_col = {med: i for i, med in enumerate(med_vocab)}
 med_ids = np.arange(len(med_vocab), dtype=np.int32)
 n_meds = len(med_vocab)
 
 
+def save_artifacts():
+    with open(ARTIFACTS_PATH, "wb") as f:
+        pickle.dump({
+            "predictions": all_preds,
+            "metrics": metrics,
+            "ground_truth": ground_truth,
+            "train_ids": train_ids,
+            "test_ids": test_ids,
+        }, f)
+    print(f"saved to {ARTIFACTS_PATH}")
+
+
+def drug_onehot(cols):
+    n = len(cols)
+    return csr_matrix(
+        (np.ones(n, dtype=np.float32), (np.arange(n), cols)),
+        shape=(n, n_meds),
+    )
+
+
+def build_candidate_block(batch_rows):
+    b = len(batch_rows)
+    repeat_idx = np.repeat(np.arange(b), n_meds)
+    drug_block = drug_onehot(np.tile(med_ids, b))
+    return hstack([feature_matrix[batch_rows][repeat_idx], drug_block], format="csr")
+
+
+def trim_preds(preds):
+    return {h: list(v)[:TOP_N_SAVED] for h, v in preds.items()}
+
+
 # ========== MODEL 1: overall medication popularity ==========
+
 # same list to every admission
 popularity_preds = {}
 for hadm_id in ground_truth:
     popularity_preds[hadm_id] = top_meds
 p, r, n = evaluate(popularity_preds, ground_truth)
 metrics["popularity"] = (p, r, n)
-print(f"\npopularity -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f}")
+print(f"\npopularity  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}")
+all_preds["popularity"] = trim_preds(popularity_preds)
+save_artifacts()
 
 
-# ========== MODEL 2: KNN/SVD ==========
-_t0 = _time.time(); print("Building full-feature KNN baseline...")
+# ========== MODEL 2: KNN ==========
+
+KNN_NEIGHBORS = 50
+KNN_BATCH_SIZE = 500
+
+t0 = time.time()
+print("building full-feature KNN baseline...")
 train_features = feature_matrix[train_rows]
 test_features = feature_matrix[test_rows]
-
-svd = TruncatedSVD(n_components=KNN_SVD_COMPONENTS, random_state=RANDOM_STATE)
-train_features_reduced = svd.fit_transform(train_features)
-test_features_reduced = svd.transform(test_features)
 
 train_drugs_by_hadm = {}
 for hadm_id, grp in train_interactions.groupby("hadm_id"):
     train_drugs_by_hadm[hadm_id] = list(grp["medication"])
 
-_drug_rows, _drug_cols = [], []
-for pos, h in enumerate(train_hadm):
-    for drug in train_drugs_by_hadm.get(h, []):
-        c = med_to_col.get(drug)
-        if c is not None:
-            _drug_rows.append(pos)
-            _drug_cols.append(c)
+drug_rows, drug_cols = [], []
+for pos, hadm_id in enumerate(train_hadm):
+    for drug in train_drugs_by_hadm.get(hadm_id, []):
+        drug_rows.append(pos)
+        drug_cols.append(med_to_col[drug])
 train_drug_matrix = csr_matrix(
-    (np.ones(len(_drug_rows), dtype=np.float32), (_drug_rows, _drug_cols)),
+    (np.ones(len(drug_rows), dtype=np.float32), (drug_rows, drug_cols)),
     shape=(len(train_rows), n_meds),
 )
 
 knn_preds = {}
-for start in range(0, len(test_rows), BATCH_SIZE):
-    batch = test_features_reduced[start : start + BATCH_SIZE]
-    sims = cosine_similarity(batch, train_features_reduced)
+for start in range(0, len(test_rows), KNN_BATCH_SIZE):
+    batch = test_features[start:start + KNN_BATCH_SIZE]
+    sims = cosine_similarity(batch, train_features)
 
     for i, row_sims in enumerate(sims):
         hadm_id = test_hadm[start + i]
@@ -256,105 +276,113 @@ for start in range(0, len(test_rows), BATCH_SIZE):
 
 p, r, n = evaluate(knn_preds, ground_truth)
 metrics["knn"] = (p, r, n)
-print(f"full-feature KNN -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
+print(f"knn  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["knn"] = trim_preds(knn_preds)
+save_artifacts()
 
 
-# ========== MODEL 3: BPR ==========
+# ========== MODEL 3: ALS ==========
+
+ALS_FACTORS = 64  # latent factors for ALS
+ALS_EPOCHS = 10
+ALS_REG = 0.01
+
 # all users/subjects in train
-train_subject_ids = np.sort(
+train_subjects = np.sort(
     features.loc[train_rows, "subject_id"].drop_duplicates().to_numpy()
 )
-
 # subject/med id to index mapping
-subject_to_row = {sid: i for i, sid in enumerate(train_subject_ids)}
+subj_to_row = {subj: i for i, subj in enumerate(train_subjects)}
 
 # build unique subject/med pairs
 hadm_to_subj = features[["hadm_id", "subject_id"]]
-train_pairs = train_interactions.merge(hadm_to_subj, on="hadm_id", how="left")
-train_pairs = train_pairs[["subject_id", "medication"]].drop_duplicates()
+patient_med_pairs = train_interactions.merge(hadm_to_subj, on="hadm_id", how="left")
+patient_med_pairs = patient_med_pairs[["subject_id", "medication"]].drop_duplicates()
 
 # subject-drug matrxi
 # 1 means seen, 0 means not observed
-rows_idx = train_pairs["subject_id"].map(subject_to_row).to_numpy()
-cols_idx = train_pairs["medication"].map(med_to_col).to_numpy()
-data = np.ones(len(train_pairs), dtype=np.float32)
-train_patient_item_matrix = csr_matrix(
-    (data, (rows_idx, cols_idx)),
-    shape=(len(train_subject_ids), len(med_vocab)),
+subj_rows = patient_med_pairs["subject_id"].map(subj_to_row).to_numpy()
+med_cols = patient_med_pairs["medication"].map(med_to_col).to_numpy()
+patient_item_matrix = csr_matrix(
+    (np.ones(len(patient_med_pairs), dtype=np.float32), (subj_rows, med_cols)),
+    shape=(len(train_subjects), len(med_vocab)),
 )
 
-_t0 = _time.time(); print("Training BPR-MF baseline...")
-bpr_model = BayesianPersonalizedRanking(
-    factors=BPR_FACTORS,
-    learning_rate=BPR_LR,
-    regularization=BPR_REG,
-    iterations=BPR_EPOCHS,
+t0 = time.time()
+print("training ALS baseline...")
+als_model = AlternatingLeastSquares(
+    factors=ALS_FACTORS,
+    regularization=ALS_REG,
+    iterations=ALS_EPOCHS,
     random_state=RANDOM_STATE,
 )
-bpr_model.fit(train_patient_item_matrix)
-bpr_med_factors = bpr_model.item_factors
+als_model.fit(patient_item_matrix)
+
 # uses prior med list to predict new medications
 prior_med_matrix = load_npz(PROCESSED_DIR / "prior_med_matrix.npz")
 all_prior_meds = np.array(sorted(interactions["medication"].unique()))
 
-bpr_preds = {}
-warm_start_count = 0
-# training loop:
+als_preds = {}
 for row_idx, hadm_id in zip(test_rows, test_hadm):
     prior_indices = prior_med_matrix[row_idx].indices
 
-    # build medication Id's this user has seen
     cols = []
     for idx in prior_indices:
-        if idx >= len(all_prior_meds):
-            continue
         med = all_prior_meds[idx]
         if med in med_to_col:
             cols.append(med_to_col[med])
 
     if len(cols) == 0:
-        bpr_preds[hadm_id] = top_meds
+        als_preds[hadm_id] = top_meds
         continue
 
-    warm_start_count += 1
-    # just a vector of their seen medications
-    user_vec = bpr_med_factors[cols].mean(axis=0)
-    scores = bpr_med_factors @ user_vec
-    # ranked medication list
-    bpr_preds[hadm_id] = med_vocab[np.argsort(scores)[::-1]].tolist()
+    user_items = csr_matrix(
+        (np.ones(len(cols), dtype=np.float32),
+         (np.zeros(len(cols), dtype=np.int32), np.array(cols, dtype=np.int32))),
+        shape=(1, n_meds),
+    )
+    ids, _ = als_model.recommend(
+        0, user_items, N=n_meds,
+        recalculate_user=True,
+        filter_already_liked_items=False,
+    )
+    als_preds[hadm_id] = med_vocab[ids].tolist()
 
-p, r, n = evaluate(bpr_preds, ground_truth)
-metrics["bpr"] = (p, r, n)
-print(f"BPR-MF -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
-print(
-    f"BPR-MF warm-start admissions in test: {warm_start_count:,} / {len(test_hadm):,}"
-)
+p, r, n = evaluate(als_preds, ground_truth)
+metrics["als"] = (p, r, n)
+print(f"als  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["als"] = trim_preds(als_preds)
+save_artifacts()
 
 
 # ========== MODEL 4: LightFM ==========
+
+LIGHTFM_FACTORS = 32
+LIGHTFM_EPOCHS = 50
+LIGHTFM_THREADS = 8
+LIGHTFM_BATCH_SIZE = 500
+
 # CF with matrix factorization but w/ all side features
-# BPR only sees patient/med, so this works with a lot more context
-train_admission_pairs = train_interactions[["hadm_id", "medication"]].drop_duplicates()
+# ALS only sees patient/med, so this works with a lot more context
+admission_drug_pairs = train_interactions[["hadm_id", "medication"]].drop_duplicates()
 
 # (admission, drug) interaction
-interaction_rows = []
-interaction_cols = []
+interaction_rows, interaction_cols = [], []
 for hadm_id, med in zip(
-    train_admission_pairs["hadm_id"], train_admission_pairs["medication"]
+    admission_drug_pairs["hadm_id"], admission_drug_pairs["medication"]
 ):
     interaction_rows.append(hadm_to_row[hadm_id])
     interaction_cols.append(med_to_col[med])
-
-interaction_data = np.ones(len(interaction_rows), dtype=np.float32)
 lightfm_interactions = csr_matrix(
-    (interaction_data, (interaction_rows, interaction_cols)),
+    (np.ones(len(interaction_rows), dtype=np.float32), (interaction_rows, interaction_cols)),
     shape=(len(features), len(med_vocab)),
 )
 
 # scaled, normalized features
 lightfm_user_features = feature_matrix
 
-_t0 = _time.time(); print("Training LightFM baseline...")
+t0 = time.time()
+print("training LightFM baseline...")
 lightfm_model = LightFM(
     no_components=LIGHTFM_FACTORS,
     loss="warp",
@@ -364,18 +392,22 @@ lightfm_model.fit(
     lightfm_interactions,
     user_features=lightfm_user_features,
     epochs=LIGHTFM_EPOCHS,
+    num_threads=LIGHTFM_THREADS,
 )
 
 lightfm_preds = {}
-for start in range(0, len(test_rows), BATCH_SIZE):
-    batch_rows = test_rows[start : start + BATCH_SIZE]
-    batch_hadm = test_hadm[start : start + BATCH_SIZE]
+for start in range(0, len(test_rows), LIGHTFM_BATCH_SIZE):
+    batch_rows = test_rows[start:start + LIGHTFM_BATCH_SIZE]
+    batch_hadm = test_hadm[start:start + LIGHTFM_BATCH_SIZE]
 
     user_ids = np.repeat(batch_rows, n_meds)
     item_ids = np.tile(med_ids, len(batch_rows))
 
-    scores = lightfm_model.predict(user_ids, item_ids, user_features=lightfm_user_features)
-    scores = scores.reshape(len(batch_rows), n_meds)
+    scores = lightfm_model.predict(
+        user_ids, item_ids,
+        user_features=lightfm_user_features,
+        num_threads=LIGHTFM_THREADS,
+    ).reshape(len(batch_rows), n_meds)
 
     for i, hadm_id in enumerate(batch_hadm):
         # sort highest first
@@ -384,84 +416,108 @@ for start in range(0, len(test_rows), BATCH_SIZE):
 
 p, r, n = evaluate(lightfm_preds, ground_truth)
 metrics["lightfm"] = (p, r, n)
-print(f"LightFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
+print(f"lightfm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["lightfm"] = trim_preds(lightfm_preds)
+save_artifacts()
 
 
 # ========== MODEL 5: LightGBM ==========
+
 # tree models can learn more expressive non-linear patterns
 # each row is (admission, drug) pair -> 0/1 label
 # no embeddings like previous models
-lgbm_train = labels[labels["hadm_id"].isin(train_ids)].copy()
-lgbm_train = lgbm_train[lgbm_train["candidate_drug"].isin(med_to_col)]
-lgbm_train = lgbm_train.sort_values("hadm_id").reset_index(drop=True)
+LGBM_BATCH_SIZE = 1000
 
-lgbm_rows = lgbm_train["hadm_id"].map(hadm_to_row).to_numpy()
-lgbm_cols = lgbm_train["candidate_drug"].map(med_to_col).to_numpy()
-lgbm_y = lgbm_train["label"].to_numpy()
-lgbm_group = lgbm_train.groupby("hadm_id", sort=False).size().to_numpy()
+lgbm_all = labels[labels["hadm_id"].isin(train_ids)].copy()
+lgbm_all = lgbm_all[lgbm_all["candidate_drug"].isin(med_to_col)]
 
-# one-hot drugs
-lgbm_drugs = csr_matrix(
-    (
-        np.ones(len(lgbm_train), dtype=np.float32),
-        (np.arange(len(lgbm_train)), lgbm_cols),
-    ),
-    shape=(len(lgbm_train), n_meds),
+all_train_hadm = np.array(sorted(train_ids))
+np.random.default_rng(RANDOM_STATE + 1).shuffle(all_train_hadm)
+n_val = int(len(all_train_hadm) * 0.1)
+val_hadm_set = set(all_train_hadm[:n_val].tolist())
+
+train_df = (
+    lgbm_all[~lgbm_all["hadm_id"].isin(val_hadm_set)]
+    .sort_values("hadm_id")
+    .reset_index(drop=True)
 )
-lgbm_x = hstack([feature_matrix[lgbm_rows], lgbm_drugs], format="csr")
-lgbm_x.sort_indices()
+val_df = (
+    lgbm_all[lgbm_all["hadm_id"].isin(val_hadm_set)]
+    .sort_values("hadm_id")
+    .reset_index(drop=True)
+)
 
-_t0 = _time.time(); print("Training LightGBM LambdaRank model...")
+train_row_idx = train_df["hadm_id"].map(hadm_to_row).to_numpy()
+train_col_idx = train_df["candidate_drug"].map(med_to_col).to_numpy()
+train_y = train_df["label"].to_numpy()
+train_groups = train_df.groupby("hadm_id", sort=False).size().to_numpy()
+# one-hot drugs
+train_x = hstack([feature_matrix[train_row_idx], drug_onehot(train_col_idx)], format="csr")
+train_x.sort_indices()
+
+val_row_idx = val_df["hadm_id"].map(hadm_to_row).to_numpy()
+val_col_idx = val_df["candidate_drug"].map(med_to_col).to_numpy()
+val_y = val_df["label"].to_numpy()
+val_groups = val_df.groupby("hadm_id", sort=False).size().to_numpy()
+val_x = hstack([feature_matrix[val_row_idx], drug_onehot(val_col_idx)], format="csr")
+val_x.sort_indices()
+
+t0 = time.time()
+print("training LightGBM LambdaRank...")
 lgbm_model = LGBMRanker(
-    n_estimators=100,
+    n_estimators=500,
     learning_rate=0.05,
-    num_leaves=31,
+    num_leaves=127,
     objective="lambdarank",  # rank, not classify
     label_gain=[0, 1],
     eval_at=[K],
     random_state=RANDOM_STATE,
-    n_jobs=4,
+    n_jobs=8,
+    force_col_wise=True,
+    max_bin=63,
     verbose=-1,
+    device='gpu',
 )
-lgbm_model.fit(lgbm_x, lgbm_y, group=lgbm_group)
-
+lgbm_model.fit(
+    train_x, train_y, group=train_groups,
+    eval_set=[(val_x, val_y)],
+    eval_group=[val_groups],
+    callbacks=[early_stopping(50), log_evaluation(100)],
+)
 
 # prediction
-def build_candidate_block(batch_rows):
-    n_users = len(batch_rows)
-    n_pairs = n_users * n_meds
-
-    user_rows = np.repeat(batch_rows, n_meds)
-    drug_cols = np.tile(med_ids, n_users)
-
-    drug_block = csr_matrix(
-        (np.ones(n_pairs, dtype=np.float32), (np.arange(n_pairs), drug_cols)),
-        shape=(n_pairs, n_meds),
-    )
-    return hstack([feature_matrix[user_rows], drug_block], format="csr")
-
-
 lgbm_preds = {}
 for start in range(0, len(test_rows), LGBM_BATCH_SIZE):
-    batch_rows = test_rows[start : start + LGBM_BATCH_SIZE]
-    batch_hadm = test_hadm[start : start + LGBM_BATCH_SIZE]
-
-    batch_x = build_candidate_block(batch_rows)
-    scores = lgbm_model.predict(batch_x).reshape(len(batch_rows), n_meds)
-
+    batch_rows = test_rows[start:start + LGBM_BATCH_SIZE]
+    batch_hadm = test_hadm[start:start + LGBM_BATCH_SIZE]
+    scores = lgbm_model.predict(build_candidate_block(batch_rows)).reshape(
+        len(batch_rows), n_meds
+    )
     for i, hadm_id in enumerate(batch_hadm):
         ranking = np.argsort(scores[i])[::-1]
         lgbm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(lgbm_preds, ground_truth)
 metrics["lgbm"] = (p, r, n)
-print(f"LightGBM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
+print(f"lgbm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["lgbm"] = trim_preds(lgbm_preds)
+save_artifacts()
 
 
 # ========== MODEL 6: DeepFM ==========
+
+DEEPFM_FACTORS = 32
+DEEPFM_EPOCHS = 5
+DEEPFM_LR = 0.001
+DEEPFM_BATCH_SIZE = 512
+DEEPFM_PRED_BATCH = 512
+
 # need to import here because of conflicts
 import torch
 from torch import nn
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"torch device: {device}")
 
 # deep learning approach
 # takes input and outputs three components: linear/fm/deep parts
@@ -488,8 +544,7 @@ class DeepFM(nn.Module):
         n_rows = len(offsets) - 1
         counts = offsets[1:] - offsets[:-1]
         row_ids = torch.repeat_interleave(
-            torch.arange(n_rows, device=idx.device),
-            counts,
+            torch.arange(n_rows, device=idx.device), counts
         )
 
         summed = torch.zeros(n_rows, DEEPFM_FACTORS, device=idx.device)
@@ -503,107 +558,168 @@ class DeepFM(nn.Module):
         return linear_part + fm_part + deep_part
 
 
-# convert for pytorch
 def sparse_to_torch(x):
     x = x.tocsr()
     counts = np.diff(x.indptr)
     offsets = np.zeros(len(counts) + 1, dtype=np.int64)
     offsets[1:] = np.cumsum(counts)
 
-    idx = torch.from_numpy(x.indices.astype(np.int64))
-    vals = torch.from_numpy(x.data.astype(np.float32))
-    offsets = torch.from_numpy(offsets)
-    return idx, offsets, vals
+    idx = torch.from_numpy(x.indices.astype(np.int64)).to(device)
+    vals = torch.from_numpy(x.data.astype(np.float32)).to(device)
+    return idx, torch.from_numpy(offsets).to(device), vals
 
 
-# trainign loop
-def train_deepfm(train_x, train_y):
+def train_torch(cls, feat_matrix, row_ids, drug_cols, train_y, n_features, name, bs, epochs, lr):
     torch.manual_seed(RANDOM_STATE)
-    model = DeepFM(train_x.shape[1])
-    opt = torch.optim.Adam(model.parameters(), lr=DEEPFM_LR)
+    model = cls(n_features).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCEWithLogitsLoss()
 
-    rows = np.arange(train_x.shape[0])
+    rows = np.arange(len(row_ids))
     rng = np.random.default_rng(RANDOM_STATE)
+    n_batches = int(np.ceil(len(rows) / bs))
+
+    print(f"  {name}: {len(row_ids):,} train pairs, "
+          f"{n_batches:,} batches/epoch, {epochs} epochs", flush=True)
 
     model.train()
-    for _ in range(DEEPFM_EPOCHS):
+    for epoch in range(1, epochs + 1):
         rng.shuffle(rows)
-        for start in range(0, len(rows), DEEPFM_BATCH_SIZE):
-            batch_rows = rows[start : start + DEEPFM_BATCH_SIZE]
-            idx, offsets, vals = sparse_to_torch(train_x[batch_rows])
-            y = torch.from_numpy(train_y[batch_rows].astype(np.float32))
+        epoch_loss = 0.0
+        epoch_t0 = time.time()
+
+        for start in range(0, len(rows), bs):
+            batch_idx = rows[start:start + bs]
+            batch_x = hstack([feat_matrix[row_ids[batch_idx]], drug_onehot(drug_cols[batch_idx])], format="csr")
+            idx, offsets, vals = sparse_to_torch(batch_x)
+            y = torch.from_numpy(train_y[batch_idx].astype(np.float32)).to(device)
 
             opt.zero_grad()
             loss = loss_fn(model(idx, offsets, vals), y)
             loss.backward()
             opt.step()
+            epoch_loss += loss.item()
+
+        print(f"  {name} epoch {epoch}/{epochs} done  "
+              f"loss={epoch_loss / n_batches:.4f}  ({time.time() - epoch_t0:.0f}s)",
+              flush=True)
 
     return model
 
 
-def predict_deepfm(model, x):
+def predict_model(model, x):
+    chunk = 16384
     model.eval()
+    n = x.shape[0]
+    out = np.empty(n, dtype=np.float32)
     with torch.no_grad():
-        idx, offsets, vals = sparse_to_torch(x)
-        return model(idx, offsets, vals).numpy()
+        for s in range(0, n, chunk):
+            sub = x[s:s + chunk]
+            idx, offsets, vals = sparse_to_torch(sub)
+            out[s:s + chunk] = model(idx, offsets, vals).cpu().numpy()
+    return out
 
 
-_t0 = _time.time(); print("Training DeepFM model...")
-# same input shape as LightGBM: admission features to one hot drugs
-deepfm_train = labels[labels["hadm_id"].isin(train_ids)].copy()
-deepfm_train = deepfm_train[deepfm_train["candidate_drug"].isin(med_to_col)]
+train_pairs = labels[labels["hadm_id"].isin(train_ids)].copy()
+train_pairs = train_pairs[train_pairs["candidate_drug"].isin(med_to_col)]
 
-deepfm_rows = deepfm_train["hadm_id"].map(hadm_to_row).to_numpy()
-deepfm_cols = deepfm_train["candidate_drug"].map(med_to_col).to_numpy()
-deepfm_y = deepfm_train["label"].to_numpy()
+row_ids = train_pairs["hadm_id"].map(hadm_to_row).to_numpy()
+drug_cols = train_pairs["candidate_drug"].map(med_to_col).to_numpy()
+y = train_pairs["label"].to_numpy()
+n_features = feature_matrix.shape[1] + n_meds
 
-deepfm_drugs = csr_matrix(
-    (
-        np.ones(len(deepfm_train), dtype=np.float32),
-        (np.arange(len(deepfm_train)), deepfm_cols),
-    ),
-    shape=(len(deepfm_train), n_meds),
+t0 = time.time()
+print("training deepfm model...", flush=True)
+deepfm_model = train_torch(
+    DeepFM, feature_matrix, row_ids, drug_cols, y, n_features,
+    "deepfm", DEEPFM_BATCH_SIZE, DEEPFM_EPOCHS, DEEPFM_LR,
 )
-deepfm_x = hstack([feature_matrix[deepfm_rows], deepfm_drugs], format="csr")
-deepfm_model = train_deepfm(deepfm_x, deepfm_y)
+torch.save(deepfm_model.state_dict(), MODELS_DIR / "deepfm.pt")
 
+print(f"scoring deepfm on {len(test_rows):,} test admissions...", flush=True)
 deepfm_preds = {}
 for start in range(0, len(test_rows), DEEPFM_PRED_BATCH):
-    batch_rows = test_rows[start : start + DEEPFM_PRED_BATCH]
-    batch_hadm = test_hadm[start : start + DEEPFM_PRED_BATCH]
-
-    batch_x = build_candidate_block(batch_rows)
-    scores = predict_deepfm(deepfm_model, batch_x)
-    scores = scores.reshape(len(batch_rows), n_meds)
-
+    batch_rows = test_rows[start:start + DEEPFM_PRED_BATCH]
+    batch_hadm = test_hadm[start:start + DEEPFM_PRED_BATCH]
+    scores = predict_model(deepfm_model, build_candidate_block(batch_rows)).reshape(
+        len(batch_rows), n_meds
+    )
     for i, hadm_id in enumerate(batch_hadm):
         ranking = np.argsort(scores[i])[::-1]
         deepfm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(deepfm_preds, ground_truth)
 metrics["deepfm"] = (p, r, n)
-print(f"DeepFM -- precision@{K}: {p:.4f}, recall@{K}: {r:.4f}, ndcg@{K}: {n:.4f} [{_time.time()-_t0:.0f}s]")
-
-# savemodels for front end
-artifacts = {
-    "predictions": {
-        "popularity": {h: list(v)[:TOP_N_SAVED] for h, v in popularity_preds.items()},
-        "knn": {h: list(v)[:TOP_N_SAVED] for h, v in knn_preds.items()},
-        "bpr": {h: list(v)[:TOP_N_SAVED] for h, v in bpr_preds.items()},
-        "lightfm": {h: list(v)[:TOP_N_SAVED] for h, v in lightfm_preds.items()},
-        "lgbm": {h: list(v)[:TOP_N_SAVED] for h, v in lgbm_preds.items()},
-        "deepfm": {h: list(v)[:TOP_N_SAVED] for h, v in deepfm_preds.items()},
-    },
-    "metrics": metrics,
-    "ground_truth": ground_truth,
-    "train_ids": train_ids,
-    "test_ids": test_ids,
-}
-
-with open(MODELS_DIR / "artifacts.pkl", "wb") as f:
-    pickle.dump(artifacts, f)
-print(f"\nSaved artifacts to {MODELS_DIR / 'artifacts.pkl'}")
+print(f"deepfm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["deepfm"] = trim_preds(deepfm_preds)
+save_artifacts()
 
 
-# ========== MODEL 7: etc - sequential? mixed/hybrid? ==========
+# ========== MODEL 7: DCN-v2 ==========
+
+DCNV2_EMBED_DIM = 64
+DCNV2_N_CROSS = 3
+DCNV2_EPOCHS = 5
+DCNV2_LR = 0.001
+DCNV2_BATCH_SIZE = 512
+DCNV2_PRED_BATCH = 512
+
+class CrossLayer(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.W = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x0, x):
+        return x0 * self.W(x) + x
+
+
+class DCNV2(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.embed = nn.EmbeddingBag(
+            n_features, DCNV2_EMBED_DIM, mode="sum", include_last_offset=True
+        )
+        self.cross = nn.ModuleList(
+            [CrossLayer(DCNV2_EMBED_DIM) for _ in range(DCNV2_N_CROSS)]
+        )
+        self.deep = nn.Sequential(
+            nn.Linear(DCNV2_EMBED_DIM, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+        )
+        self.out = nn.Linear(DCNV2_EMBED_DIM + 64, 1)
+
+    def forward(self, idx, offsets, vals):
+        x0 = self.embed(idx, offsets, per_sample_weights=vals)
+        x = x0
+        for layer in self.cross:
+            x = layer(x0, x)
+        return self.out(torch.cat([x, self.deep(x0)], dim=1)).squeeze(1)
+
+
+t0 = time.time()
+print("training dcnv2 model...", flush=True)
+dcnv2_model = train_torch(
+    DCNV2, feature_matrix, row_ids, drug_cols, y, n_features,
+    "dcnv2", DCNV2_BATCH_SIZE, DCNV2_EPOCHS, DCNV2_LR,
+)
+torch.save(dcnv2_model.state_dict(), MODELS_DIR / "dcnv2.pt")
+
+print(f"scoring dcnv2 on {len(test_rows):,} test admissions...", flush=True)
+dcnv2_preds = {}
+for start in range(0, len(test_rows), DCNV2_PRED_BATCH):
+    batch_rows = test_rows[start:start + DCNV2_PRED_BATCH]
+    batch_hadm = test_hadm[start:start + DCNV2_PRED_BATCH]
+    scores = predict_model(dcnv2_model, build_candidate_block(batch_rows)).reshape(
+        len(batch_rows), n_meds
+    )
+    for i, hadm_id in enumerate(batch_hadm):
+        ranking = np.argsort(scores[i])[::-1]
+        dcnv2_preds[hadm_id] = med_vocab[ranking].tolist()
+
+p, r, n = evaluate(dcnv2_preds, ground_truth)
+metrics["dcnv2"] = (p, r, n)
+print(f"dcnv2  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+all_preds["dcnv2"] = trim_preds(dcnv2_preds)
+save_artifacts()

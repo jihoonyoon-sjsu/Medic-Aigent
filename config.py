@@ -6,6 +6,7 @@ import pandas as pd
 
 DATA_DIR = Path("mimic_data/baseline_tables")
 PROCESSED_DIR = Path("mimic_data/processed")
+REFERENCE_DIR = Path("mimic_data/reference")
 
 RANDOM_STATE = 42
 

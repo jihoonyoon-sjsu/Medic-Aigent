@@ -10,12 +10,11 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, save_npz
 
-from config import DATA_DIR, PROCESSED_DIR, RANDOM_STATE, LAB_SOURCES, load_raw_tables
+from config import DATA_DIR, PROCESSED_DIR, REFERENCE_DIR, RANDOM_STATE, LAB_SOURCES, load_raw_tables
 
 # negative sampling
 # model needs both positive and negative examples to learn what is good/bad
-# we can change this to per positive.
-NEGATIVES_PER_ADMISSION = 10
+NEGATIVES_PER_POSITIVE = 10
 
 
 # build diagnoses matrix
@@ -29,7 +28,7 @@ def build_current_dx_matrix(snapshot, diagnoses):
     hadm_to_row = {h: i for i, h in enumerate(snap_hadms)}
 
     dx = diagnoses.dropna(subset=["hadm_id", "icd_code"]).copy()
-    dx["icd_code"] = dx["icd_code"].fillna("").astype(str).str.strip()
+    dx["icd_code"] = dx["icd_code"].astype(str).str.strip()
     dx = dx[dx["icd_code"] != ""]
     dx = dx[dx["hadm_id"].isin(hadm_to_row)]
     dx = dx[["hadm_id", "icd_code"]].drop_duplicates()
@@ -60,11 +59,11 @@ def compute_history(snapshot, diagnoses, interactions, procedures, dx_codes, med
 
     # per admission diagnosis/medication/procedure sets
     dx_clean = diagnoses.dropna(subset=["hadm_id", "icd_code"]).copy()
-    dx_clean["icd_code"] = dx_clean["icd_code"].fillna("").astype(str).str.strip()
+    dx_clean["icd_code"] = dx_clean["icd_code"].astype(str).str.strip()
     dx_clean = dx_clean[dx_clean["icd_code"] != ""]
 
     proc_clean = procedures.dropna(subset=["hadm_id", "icd_code"]).copy()
-    proc_clean["icd_code"] = proc_clean["icd_code"].fillna("").astype(str).str.strip()
+    proc_clean["icd_code"] = proc_clean["icd_code"].astype(str).str.strip()
     proc_clean = proc_clean[proc_clean["icd_code"] != ""]
 
     current_dx_by_hadm = {}
@@ -203,7 +202,7 @@ def make_label_table(snapshot, interactions):
 
     rows = []
     for hadm_id in snapshot["hadm_id"]:
-        positive_drugs = positive_by_hadm.get(hadm_id, set())
+        positive_drugs = positive_by_hadm[hadm_id]
 
         for drug in sorted(positive_drugs):
             rows.append({"hadm_id": hadm_id, "candidate_drug": drug, "label": 1})
@@ -211,7 +210,7 @@ def make_label_table(snapshot, interactions):
         # sample negatives from drugs not given in this admission
         non_positive_drugs = [d for d in all_drugs if d not in positive_drugs]
 
-        n_neg = min(NEGATIVES_PER_ADMISSION, len(non_positive_drugs))
+        n_neg = min(NEGATIVES_PER_POSITIVE * len(positive_drugs), len(non_positive_drugs))
         negative_drugs = rng.choice(non_positive_drugs, size=n_neg, replace=False)
 
         for drug in sorted(negative_drugs):
@@ -223,12 +222,6 @@ def make_label_table(snapshot, interactions):
 # === put everything together ===
 
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-existing_metadata = {}
-metadata_path = PROCESSED_DIR / "feature_metadata.json"
-if metadata_path.exists():
-    with open(metadata_path) as fp:
-        existing_metadata = json.load(fp)
 
 print("loading raw tables...")
 admissions, patients, diagnoses, emar = load_raw_tables()
@@ -250,7 +243,16 @@ interactions = interactions[interactions["medication"] != ""]
 # for each admission, what drugs were administered (no dups)
 interactions = interactions[["hadm_id", "medication"]].drop_duplicates()
 interactions = interactions.reset_index(drop=True)
+
+# normalized medication
+drug_to_ingredient = pd.read_csv(REFERENCE_DIR / "drug_to_ingredient.csv")
+d2i = dict(zip(drug_to_ingredient["drug"], drug_to_ingredient["ingredient_name"]))
+interactions["medication"] = interactions["medication"].map(d2i).fillna(interactions["medication"])
+interactions = interactions.drop_duplicates().reset_index(drop=True)
+
 print("interactions:", len(interactions))
+print("Top 20 medications after normalization:")
+print(interactions["medication"].value_counts().head(20))
 
 
 # start by joining patients/admissions, building basic blocks
@@ -274,20 +276,33 @@ snapshot = snapshot.sort_values(["subject_id", "admittime", "hadm_id"])
 snapshot = snapshot.reset_index(drop=True)
 print("snapshot:", snapshot.shape)
 
+# normalized diagnosis/prcedures
+dx_map = pd.read_csv(REFERENCE_DIR / "dx_ccsr_map.csv", dtype=str)
+proc_map = pd.read_csv(REFERENCE_DIR / "proc_ccs_map.csv", dtype=str)
+diagnoses_norm = (
+    diagnoses.assign(icd_version=diagnoses["icd_version"].astype(str))
+    .merge(dx_map, on=["icd_code", "icd_version"], how="inner")
+    [["hadm_id", "ccsr_category"]].rename(columns={"ccsr_category": "icd_code"})
+)
+procedures_norm = (
+    procedures.assign(icd_version=procedures["icd_version"].astype(str))
+    .merge(proc_map, on=["icd_code", "icd_version"], how="inner")
+    [["hadm_id", "ccs_category"]].rename(columns={"ccs_category": "icd_code"})
+)
+print(f"dx: {diagnoses_norm['icd_code'].nunique()} CCSR categories, proc: {procedures_norm['icd_code'].nunique()} CCS categories")
 
 print("building current dx matrix...")
-current_dx_matrix, dx_codes = build_current_dx_matrix(snapshot, diagnoses)
+current_dx_matrix, dx_codes = build_current_dx_matrix(snapshot, diagnoses_norm)
 medications = sorted(interactions["medication"].unique())
 print("dx codes:", len(dx_codes), "medications:", len(medications))
 
 print("building current proc matrix...")
-# use prev dx build function, same process
-current_proc_matrix, proc_codes = build_current_dx_matrix(snapshot, procedures)
+current_proc_matrix, proc_codes = build_current_dx_matrix(snapshot, procedures_norm)
 print("proc codes:", len(proc_codes))
 
 print("computing history features...")
 history_features, prior_dx_matrix, prior_med_matrix, prior_proc_matrix = compute_history(
-    snapshot, diagnoses, interactions, procedures, dx_codes, medications, proc_codes
+    snapshot, diagnoses_norm, interactions, procedures_norm, dx_codes, medications, proc_codes
 )
 
 patient_admission_snapshot = pd.concat([snapshot, history_features], axis=1)
@@ -314,67 +329,27 @@ patient_admission_snapshot = patient_admission_snapshot.merge(
 print("building lab matrices...")
 lab_cols_by_source = {}
 for source in LAB_SOURCES:
-    cur_path = PROCESSED_DIR / f"current_{source}_labs.npz"
-    pri_path = PROCESSED_DIR / f"prior_{source}_labs.npz"
-    cached_cols = existing_metadata.get("lab_sources", {}).get(source)
-    if cur_path.exists() and pri_path.exists() and cached_cols is not None:
-        print(f"  {source} already exists. skipping.")
-        lab_cols_by_source[source] = cached_cols
-        continue
     print(f"  {source}...")
     current_v, current_f, lab_cols = build_current_labs(snapshot, source)
     prior_v, prior_f = compute_prior_labs(snapshot, current_v, current_f)
-    np.savez_compressed(cur_path, values=current_v, flags=current_f)
-    np.savez_compressed(pri_path, values=prior_v, flags=prior_f)
+    np.savez_compressed(PROCESSED_DIR / f"current_{source}_labs.npz", values=current_v, flags=current_f)
+    np.savez_compressed(PROCESSED_DIR / f"prior_{source}_labs.npz", values=prior_v, flags=prior_f)
     lab_cols_by_source[source] = lab_cols
 
-label_path = PROCESSED_DIR / "admission_drug_labels.csv"
-if label_path.exists():
-    print(f"{label_path.name} already exists. skipping.")
-else:
-    print("making label table...")
-    admission_drug_labels = make_label_table(snapshot, interactions)
-    print("label rows:", len(admission_drug_labels))
-    admission_drug_labels.to_csv(label_path, index=False)
+print("making label table...")
+admission_drug_labels = make_label_table(snapshot, interactions)
+print("label rows:", len(admission_drug_labels))
+admission_drug_labels.to_csv(PROCESSED_DIR / "admission_drug_labels.csv", index=False)
 
 
 # save everything
 
-path = PROCESSED_DIR / "patient_admission_snapshot.csv"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    patient_admission_snapshot.to_csv(path, index=False)
-
-path = PROCESSED_DIR / "current_dx_matrix.npz"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    save_npz(path, current_dx_matrix)
-
-path = PROCESSED_DIR / "prior_dx_matrix.npz"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    save_npz(path, prior_dx_matrix)
-
-path = PROCESSED_DIR / "prior_med_matrix.npz"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    save_npz(path, prior_med_matrix)
-
-path = PROCESSED_DIR / "current_proc_matrix.npz"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    save_npz(path, current_proc_matrix)
-
-path = PROCESSED_DIR / "prior_proc_matrix.npz"
-if path.exists():
-    print(f"{path.name} already exists. skipping.")
-else:
-    save_npz(path, prior_proc_matrix)
+patient_admission_snapshot.to_csv(PROCESSED_DIR / "patient_admission_snapshot.csv", index=False)
+save_npz(PROCESSED_DIR / "current_dx_matrix.npz", current_dx_matrix)
+save_npz(PROCESSED_DIR / "prior_dx_matrix.npz", prior_dx_matrix)
+save_npz(PROCESSED_DIR / "prior_med_matrix.npz", prior_med_matrix)
+save_npz(PROCESSED_DIR / "current_proc_matrix.npz", current_proc_matrix)
+save_npz(PROCESSED_DIR / "prior_proc_matrix.npz", prior_proc_matrix)
 
 charlson_cols = [c for c in charlson.columns if c != "hadm_id"]
 metadata = {
@@ -383,24 +358,10 @@ metadata = {
     "proc_codes": proc_codes,
     "lab_sources": lab_cols_by_source,
     "charlson_cols": charlson_cols,
-    "negatives_per_admission": NEGATIVES_PER_ADMISSION,
+    "negatives_per_positive": NEGATIVES_PER_POSITIVE,
     "random_state": RANDOM_STATE,
 }
-if metadata_path.exists():
-    print(f"{metadata_path.name} already exists. skipping.")
-else:
-    with open(metadata_path, "w") as fp:
-        json.dump(metadata, fp, indent=2)
+with open(PROCESSED_DIR / "feature_metadata.json", "w") as fp:
+    json.dump(metadata, fp, indent=2)
 
 print("done")
-
-# final files:
-# - patient_admission_snapshot.csv
-# - admission_drug_labels.csv
-# - current_dx_matrix.npz
-# - prior_dx_matrix.npz
-# - prior_med_matrix.npz
-# - current_proc_matrix.npz
-# - prior_proc_matrix.npz
-# - current_{source}_labs.npz / prior_{source}_labs.npz for each lab source
-# - feature_metadata.json
