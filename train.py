@@ -217,6 +217,12 @@ def trim_preds(preds):
     return {h: list(v)[:TOP_N_SAVED] for h, v in preds.items()}
 
 
+# save stuff needed for app.py
+def save_pickle(name, obj):
+    with open(MODELS_DIR / name, "wb") as f:
+        pickle.dump(obj, f)
+
+
 # ========== MODEL 1: overall medication popularity ==========
 
 # same list to every admission
@@ -228,6 +234,16 @@ metrics["popularity"] = (p, r, n)
 print(f"\npopularity  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}")
 all_preds["popularity"] = trim_preds(popularity_preds)
 save_artifacts()
+
+# shared data for all model saves
+save_pickle("shared.pkl", {
+    "feature_matrix": feature_matrix,
+    "med_vocab": med_vocab,
+    "hadm_to_row": hadm_to_row,
+    "med_to_col": med_to_col,
+    "top_meds": top_meds,
+    "n_meds": n_meds,
+})
 
 
 # ========== MODEL 2: KNN ==========
@@ -279,6 +295,11 @@ metrics["knn"] = (p, r, n)
 print(f"knn  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
 all_preds["knn"] = trim_preds(knn_preds)
 save_artifacts()
+
+save_pickle("knn.pkl", {
+    "train_features": train_features,
+    "train_drug_matrix": train_drug_matrix,
+})
 
 
 # ========== MODEL 3: ALS ==========
@@ -420,6 +441,8 @@ print(f"lightfm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() -
 all_preds["lightfm"] = trim_preds(lightfm_preds)
 save_artifacts()
 
+save_pickle("lightfm.pkl", lightfm_model)
+
 
 # ========== MODEL 5: LightGBM ==========
 
@@ -502,6 +525,8 @@ metrics["lgbm"] = (p, r, n)
 print(f"lgbm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
 all_preds["lgbm"] = trim_preds(lgbm_preds)
 save_artifacts()
+
+save_pickle("lgbm.pkl", lgbm_model)
 
 
 # ========== MODEL 6: DeepFM ==========
