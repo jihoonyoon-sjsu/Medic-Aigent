@@ -177,8 +177,8 @@ test_hadm = hadm_ids[test_rows]
 
 print("building feature matrix...")
 feature_matrix = build_full_feature_matrix(features, train_rows)
-feature_matrix.indptr = feature_matrix.indptr.astype(np.int64)
-feature_matrix.indices = feature_matrix.indices.astype(np.int64)
+feature_matrix.indptr = feature_matrix.indptr.astype(np.int32)
+feature_matrix.indices = feature_matrix.indices.astype(np.int32)
 
 med_vocab = np.array(sorted(train_interactions["medication"].unique()))
 med_to_col = {med: i for i, med in enumerate(med_vocab)}
@@ -414,6 +414,7 @@ lightfm_model.fit(
     user_features=lightfm_user_features,
     epochs=LIGHTFM_EPOCHS,
     num_threads=LIGHTFM_THREADS,
+    verbose=True,
 )
 
 lightfm_preds = {}
