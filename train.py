@@ -198,21 +198,6 @@ def save_artifacts():
     print(f"saved to {ARTIFACTS_PATH}")
 
 
-def drug_onehot(cols):
-    n = len(cols)
-    return csr_matrix(
-        (np.ones(n, dtype=np.float32), (np.arange(n), cols)),
-        shape=(n, n_meds),
-    )
-
-
-def build_candidate_block(batch_rows):
-    b = len(batch_rows)
-    repeat_idx = np.repeat(np.arange(b), n_meds)
-    drug_block = drug_onehot(np.tile(med_ids, b))
-    return hstack([feature_matrix[batch_rows][repeat_idx], drug_block], format="csr")
-
-
 def trim_preds(preds):
     return {h: list(v)[:TOP_N_SAVED] for h, v in preds.items()}
 
@@ -452,6 +437,10 @@ save_pickle("lightfm.pkl", lightfm_model)
 # no embeddings like previous models
 LGBM_BATCH_SIZE = 1000
 
+def build_lgbm_block(rows, cols):
+    drug_col = csr_matrix(np.asarray(cols, dtype=np.float32).reshape(-1, 1))
+    return hstack([feature_matrix[rows], drug_col], format="csr")
+
 lgbm_all = labels[labels["hadm_id"].isin(train_ids)].copy()
 lgbm_all = lgbm_all[lgbm_all["candidate_drug"].isin(med_to_col)]
 
@@ -475,15 +464,14 @@ train_row_idx = train_df["hadm_id"].map(hadm_to_row).to_numpy()
 train_col_idx = train_df["candidate_drug"].map(med_to_col).to_numpy()
 train_y = train_df["label"].to_numpy()
 train_groups = train_df.groupby("hadm_id", sort=False).size().to_numpy()
-# one-hot drugs
-train_x = hstack([feature_matrix[train_row_idx], drug_onehot(train_col_idx)], format="csr")
+train_x = build_lgbm_block(train_row_idx, train_col_idx)
 train_x.sort_indices()
 
 val_row_idx = val_df["hadm_id"].map(hadm_to_row).to_numpy()
 val_col_idx = val_df["candidate_drug"].map(med_to_col).to_numpy()
 val_y = val_df["label"].to_numpy()
 val_groups = val_df.groupby("hadm_id", sort=False).size().to_numpy()
-val_x = hstack([feature_matrix[val_row_idx], drug_onehot(val_col_idx)], format="csr")
+val_x = build_lgbm_block(val_row_idx, val_col_idx)
 val_x.sort_indices()
 
 t0 = time.time()
@@ -506,6 +494,7 @@ lgbm_model.fit(
     train_x, train_y, group=train_groups,
     eval_set=[(val_x, val_y)],
     eval_group=[val_groups],
+    categorical_feature=[feature_matrix.shape[1]],
     callbacks=[early_stopping(50), log_evaluation(100)],
 )
 
@@ -514,7 +503,10 @@ lgbm_preds = {}
 for start in range(0, len(test_rows), LGBM_BATCH_SIZE):
     batch_rows = test_rows[start:start + LGBM_BATCH_SIZE]
     batch_hadm = test_hadm[start:start + LGBM_BATCH_SIZE]
-    scores = lgbm_model.predict(build_candidate_block(batch_rows)).reshape(
+    scores = lgbm_model.predict(build_lgbm_block(
+        np.repeat(batch_rows, n_meds),
+        np.tile(med_ids, len(batch_rows)),
+    )).reshape(
         len(batch_rows), n_meds
     )
     for i, hadm_id in enumerate(batch_hadm):
@@ -533,14 +525,16 @@ save_pickle("lgbm.pkl", lgbm_model)
 # ========== MODEL 6: DeepFM ==========
 
 DEEPFM_FACTORS = 32
-DEEPFM_EPOCHS = 5
+DEEPFM_EPOCHS = 20
 DEEPFM_LR = 0.001
-DEEPFM_BATCH_SIZE = 512
+DEEPFM_BATCH_SIZE = 32
 DEEPFM_PRED_BATCH = 512
+DEEPFM_WEIGHT_DECAY = 1e-5
 
 # need to import here because of conflicts
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"torch device: {device}")
@@ -555,13 +549,23 @@ class DeepFM(nn.Module):
             n_features, 1, mode="sum", include_last_offset=True
         )
         self.fm = nn.Embedding(n_features, DEEPFM_FACTORS)
+        self.user_deep = nn.EmbeddingBag(
+            feature_matrix.shape[1], DEEPFM_FACTORS, mode="sum", include_last_offset=True
+        )
+        self.drug_deep = nn.Embedding(n_meds, DEEPFM_FACTORS)
+        nn.init.normal_(self.linear.weight, std=1e-2)
+        nn.init.normal_(self.fm.weight, std=1e-2)
+        nn.init.normal_(self.user_deep.weight, std=1e-2)
+        nn.init.normal_(self.drug_deep.weight, std=1e-2)
         self.deep = nn.Sequential(
-            nn.Linear(DEEPFM_FACTORS, 64),
+            nn.Linear(DEEPFM_FACTORS * 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
 
-    def forward(self, idx, offsets, vals):
+    def forward(self, idx, offsets, vals, user_idx, user_offsets, user_vals, drug_cols):
         # linear
         linear_part = self.linear(idx, offsets, per_sample_weights=vals).squeeze(1)
 
@@ -577,88 +581,148 @@ class DeepFM(nn.Module):
         squared = torch.zeros(n_rows, DEEPFM_FACTORS, device=idx.device)
         summed.index_add_(0, row_ids, emb)
         squared.index_add_(0, row_ids, emb * emb)
+        fm_part = 0.5 * ((summed * summed) - squared).sum(1)
 
         # deep
-        fm_part = 0.5 * ((summed * summed) - squared).sum(1)
-        deep_part = self.deep(summed).squeeze(1)
+        user_part = self.user_deep(
+            user_idx, user_offsets, per_sample_weights=user_vals
+        )
+        drug_part = self.drug_deep(drug_cols)
+        deep_part = self.deep(torch.cat([user_part, drug_part], dim=1)).squeeze(1)
         return linear_part + fm_part + deep_part
 
 
-def sparse_to_torch(x):
-    x = x.tocsr()
+def pairs_to_torch(feat_matrix, rows, cols):
+    x = feat_matrix[rows].tocsr()
     counts = np.diff(x.indptr)
-    offsets = np.zeros(len(counts) + 1, dtype=np.int64)
-    offsets[1:] = np.cumsum(counts)
 
-    idx = torch.from_numpy(x.indices.astype(np.int64)).to(device)
-    vals = torch.from_numpy(x.data.astype(np.float32)).to(device)
-    return idx, torch.from_numpy(offsets).to(device), vals
+    user_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+    user_offsets[1:] = np.cumsum(counts)
+
+    pair_counts = counts + 1
+    pair_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+    pair_offsets[1:] = np.cumsum(pair_counts)
+
+    idx = np.empty(pair_offsets[-1], dtype=np.int64)
+    vals = np.empty(pair_offsets[-1], dtype=np.float32)
+    for i in range(len(rows)):
+        s, e = x.indptr[i], x.indptr[i + 1]
+        ps = pair_offsets[i]
+        k = e - s
+        idx[ps:ps + k] = x.indices[s:e]
+        vals[ps:ps + k] = x.data[s:e]
+        idx[ps + k] = feat_matrix.shape[1] + cols[i]
+        vals[ps + k] = 1.0
+
+    return (
+        torch.from_numpy(idx).to(device),
+        torch.from_numpy(pair_offsets).to(device),
+        torch.from_numpy(vals).to(device),
+        torch.from_numpy(x.indices.astype(np.int64)).to(device),
+        torch.from_numpy(user_offsets).to(device),
+        torch.from_numpy(x.data.astype(np.float32)).to(device),
+        torch.from_numpy(cols.astype(np.int64)).to(device),
+    )
 
 
-def train_torch(cls, feat_matrix, row_ids, drug_cols, train_y, n_features, name, bs, epochs, lr):
+def train_torch_lambdarank(cls, feat_matrix, train_groups, val_groups, n_features, name, bs, epochs, lr, weight_decay):
     torch.manual_seed(RANDOM_STATE)
     model = cls(n_features).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.BCEWithLogitsLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    rows = np.arange(len(row_ids))
+    train_keys = list(train_groups.keys())
+    val_keys = list(val_groups.keys())
     rng = np.random.default_rng(RANDOM_STATE)
-    n_batches = int(np.ceil(len(rows) / bs))
+    n_batches = int(np.ceil(len(train_keys) / bs))
 
-    print(f"  {name}: {len(row_ids):,} train pairs, "
-          f"{n_batches:,} batches/epoch, {epochs} epochs", flush=True)
+    print(f"  {name}: {len(train_keys):,} train groups, "
+          f"{len(val_keys):,} val groups, up to {epochs} epochs", flush=True)
 
-    model.train()
     for epoch in range(1, epochs + 1):
-        rng.shuffle(rows)
+        rng.shuffle(train_keys)
+        model.train()
         epoch_loss = 0.0
         epoch_t0 = time.time()
 
-        for start in range(0, len(rows), bs):
-            batch_idx = rows[start:start + bs]
-            batch_x = hstack([feat_matrix[row_ids[batch_idx]], drug_onehot(drug_cols[batch_idx])], format="csr")
-            idx, offsets, vals = sparse_to_torch(batch_x)
-            y = torch.from_numpy(train_y[batch_idx].astype(np.float32)).to(device)
+        for start in range(0, len(train_keys), bs):
+            batch_keys = train_keys[start:start + bs]
+            cols_list, rows_list, splits, n_pos_list = [], [], [0], []
+            for hadm_id in batch_keys:
+                pos, neg = train_groups[hadm_id]
+                cols_list.append(np.concatenate([pos, neg]))
+                rows_list.append(np.full(len(pos) + len(neg), hadm_to_row[hadm_id], dtype=np.int32))
+                splits.append(splits[-1] + len(pos) + len(neg))
+                n_pos_list.append(len(pos))
+            cols = np.concatenate(cols_list).astype(np.int32)
+            rows = np.concatenate(rows_list)
 
+            scores = model(*pairs_to_torch(feat_matrix, rows, cols))
             opt.zero_grad()
-            loss = loss_fn(model(idx, offsets, vals), y)
+            loss = 0.0
+            for i, (s, e) in enumerate(zip(splits[:-1], splits[1:])):
+                n_pos = n_pos_list[i]
+                sc = scores[s:e]
+                with torch.no_grad():
+                    disc = 1.0 / torch.log2(sc.argsort(descending=True).argsort().float() + 2)
+                pos_s, neg_s = sc[:n_pos].unsqueeze(1), sc[n_pos:].unsqueeze(0)
+                lam = (disc[:n_pos].unsqueeze(1) - disc[n_pos:].unsqueeze(0)).abs()
+                loss = loss + (lam * F.softplus(neg_s - pos_s)).sum() / lam.sum()
+            loss = loss / len(batch_keys)
             loss.backward()
             opt.step()
             epoch_loss += loss.item()
 
-        print(f"  {name} epoch {epoch}/{epochs} done  "
-              f"loss={epoch_loss / n_batches:.4f}  ({time.time() - epoch_t0:.0f}s)",
-              flush=True)
+        model.eval()
+        n_list = []
+        with torch.no_grad():
+            for hadm_id in val_keys:
+                pos, neg = val_groups[hadm_id]
+                cols = np.concatenate([pos, neg]).astype(np.int32)
+                rows = np.full(len(cols), hadm_to_row[hadm_id], dtype=np.int32)
+                sc = model(*pairs_to_torch(feat_matrix, rows, cols)).cpu().numpy()
+                order = np.argsort(sc)[::-1]
+                n_list.append(ndcg_at_k(cols[order].tolist()[:K], set(pos.tolist())))
+        val_ndcg = float(np.mean(n_list))
+
+        print(f"  {name} epoch {epoch}/{epochs}  loss={epoch_loss / n_batches:.4f}  "
+              f"val_ndcg={val_ndcg:.4f}  ({time.time() - epoch_t0:.0f}s)", flush=True)
 
     return model
 
 
-def predict_model(model, x):
+def predict_model(model, rows, cols):
     chunk = 16384
     model.eval()
-    n = x.shape[0]
+    n = len(rows)
     out = np.empty(n, dtype=np.float32)
     with torch.no_grad():
         for s in range(0, n, chunk):
-            sub = x[s:s + chunk]
-            idx, offsets, vals = sparse_to_torch(sub)
-            out[s:s + chunk] = model(idx, offsets, vals).cpu().numpy()
+            out[s:s + chunk] = model(
+                *pairs_to_torch(feature_matrix, rows[s:s + chunk], cols[s:s + chunk])
+            ).cpu().numpy()
     return out
 
 
-train_pairs = labels[labels["hadm_id"].isin(train_ids)].copy()
-train_pairs = train_pairs[train_pairs["candidate_drug"].isin(med_to_col)]
+candidate_pairs = labels[labels["hadm_id"].isin(train_ids)].copy()
+candidate_pairs = candidate_pairs[candidate_pairs["candidate_drug"].isin(med_to_col)]
+candidate_pairs["col"] = candidate_pairs["candidate_drug"].map(med_to_col).astype(np.int32)
 
-row_ids = train_pairs["hadm_id"].map(hadm_to_row).to_numpy()
-drug_cols = train_pairs["candidate_drug"].map(med_to_col).to_numpy()
-y = train_pairs["label"].to_numpy()
+torch_train_groups, torch_val_groups = {}, {}
+for hadm_id, grp in candidate_pairs.groupby("hadm_id"):
+    pos = grp.loc[grp["label"] == 1, "col"].to_numpy()
+    neg = grp.loc[grp["label"] == 0, "col"].to_numpy()
+    if not (len(pos) and len(neg)):
+        continue
+    bucket = torch_val_groups if hadm_id in val_hadm_set else torch_train_groups
+    bucket[hadm_id] = (pos, neg)
+
 n_features = feature_matrix.shape[1] + n_meds
 
 t0 = time.time()
 print("training deepfm model...", flush=True)
-deepfm_model = train_torch(
-    DeepFM, feature_matrix, row_ids, drug_cols, y, n_features,
-    "deepfm", DEEPFM_BATCH_SIZE, DEEPFM_EPOCHS, DEEPFM_LR,
+deepfm_model = train_torch_lambdarank(
+    DeepFM, feature_matrix, torch_train_groups, torch_val_groups, n_features,
+    "deepfm", DEEPFM_BATCH_SIZE, DEEPFM_EPOCHS, DEEPFM_LR, DEEPFM_WEIGHT_DECAY,
 )
 torch.save(deepfm_model.state_dict(), MODELS_DIR / "deepfm.pt")
 
@@ -667,9 +731,11 @@ deepfm_preds = {}
 for start in range(0, len(test_rows), DEEPFM_PRED_BATCH):
     batch_rows = test_rows[start:start + DEEPFM_PRED_BATCH]
     batch_hadm = test_hadm[start:start + DEEPFM_PRED_BATCH]
-    scores = predict_model(deepfm_model, build_candidate_block(batch_rows)).reshape(
-        len(batch_rows), n_meds
-    )
+    scores = predict_model(
+        deepfm_model,
+        np.repeat(batch_rows, n_meds),
+        np.tile(med_ids, len(batch_rows)),
+    ).reshape(len(batch_rows), n_meds)
     for i, hadm_id in enumerate(batch_hadm):
         ranking = np.argsort(scores[i])[::-1]
         deepfm_preds[hadm_id] = med_vocab[ranking].tolist()
@@ -685,39 +751,50 @@ save_artifacts()
 
 DCNV2_EMBED_DIM = 64
 DCNV2_N_CROSS = 3
-DCNV2_EPOCHS = 5
+DCNV2_EPOCHS = 20
 DCNV2_LR = 0.001
-DCNV2_BATCH_SIZE = 512
+DCNV2_BATCH_SIZE = 32
 DCNV2_PRED_BATCH = 512
+DCNV2_WEIGHT_DECAY = 1e-5
+DCNV2_RANK = 16
 
 class CrossLayer(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, rank):
         super().__init__()
-        self.W = nn.Linear(dim, dim, bias=True)
+        self.v = nn.Linear(dim, rank, bias=False)
+        self.u = nn.Linear(rank, dim, bias=True)
 
     def forward(self, x0, x):
-        return x0 * self.W(x) + x
+        return x0 * self.u(self.v(x)) + x
 
 
 class DCNV2(nn.Module):
     def __init__(self, n_features):
         super().__init__()
-        self.embed = nn.EmbeddingBag(
-            n_features, DCNV2_EMBED_DIM, mode="sum", include_last_offset=True
+        self.user_embed = nn.EmbeddingBag(
+            feature_matrix.shape[1], DCNV2_EMBED_DIM, mode="sum", include_last_offset=True
         )
+        self.drug_embed = nn.Embedding(n_meds, DCNV2_EMBED_DIM)
+        dim = DCNV2_EMBED_DIM * 2
+        nn.init.normal_(self.user_embed.weight, std=1e-2)
+        nn.init.normal_(self.drug_embed.weight, std=1e-2)
         self.cross = nn.ModuleList(
-            [CrossLayer(DCNV2_EMBED_DIM) for _ in range(DCNV2_N_CROSS)]
+            [CrossLayer(dim, DCNV2_RANK) for _ in range(DCNV2_N_CROSS)]
         )
         self.deep = nn.Sequential(
-            nn.Linear(DCNV2_EMBED_DIM, 128),
+            nn.Linear(dim, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
         )
-        self.out = nn.Linear(DCNV2_EMBED_DIM + 64, 1)
+        self.out = nn.Linear(dim + 64, 1)
 
-    def forward(self, idx, offsets, vals):
-        x0 = self.embed(idx, offsets, per_sample_weights=vals)
+    def forward(self, idx, offsets, vals, user_idx, user_offsets, user_vals, drug_cols):
+        user_part = self.user_embed(
+            user_idx, user_offsets, per_sample_weights=user_vals
+        )
+        drug_part = self.drug_embed(drug_cols)
+        x0 = torch.cat([user_part, drug_part], dim=1)
         x = x0
         for layer in self.cross:
             x = layer(x0, x)
@@ -726,9 +803,9 @@ class DCNV2(nn.Module):
 
 t0 = time.time()
 print("training dcnv2 model...", flush=True)
-dcnv2_model = train_torch(
-    DCNV2, feature_matrix, row_ids, drug_cols, y, n_features,
-    "dcnv2", DCNV2_BATCH_SIZE, DCNV2_EPOCHS, DCNV2_LR,
+dcnv2_model = train_torch_lambdarank(
+    DCNV2, feature_matrix, torch_train_groups, torch_val_groups, n_features,
+    "dcnv2", DCNV2_BATCH_SIZE, DCNV2_EPOCHS, DCNV2_LR, DCNV2_WEIGHT_DECAY,
 )
 torch.save(dcnv2_model.state_dict(), MODELS_DIR / "dcnv2.pt")
 
@@ -737,9 +814,11 @@ dcnv2_preds = {}
 for start in range(0, len(test_rows), DCNV2_PRED_BATCH):
     batch_rows = test_rows[start:start + DCNV2_PRED_BATCH]
     batch_hadm = test_hadm[start:start + DCNV2_PRED_BATCH]
-    scores = predict_model(dcnv2_model, build_candidate_block(batch_rows)).reshape(
-        len(batch_rows), n_meds
-    )
+    scores = predict_model(
+        dcnv2_model,
+        np.repeat(batch_rows, n_meds),
+        np.tile(med_ids, len(batch_rows)),
+    ).reshape(len(batch_rows), n_meds)
     for i, hadm_id in enumerate(batch_hadm):
         ranking = np.argsort(scores[i])[::-1]
         dcnv2_preds[hadm_id] = med_vocab[ranking].tolist()
