@@ -12,7 +12,7 @@ from scipy.sparse import csr_matrix, diags, hstack, load_npz
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MaxAbsScaler
 
-from lightgbm import LGBMRanker, early_stopping, log_evaluation
+from lightgbm import Dataset, early_stopping, log_evaluation, train as lgb_train
 from lightfm import LightFM
 from implicit.als import AlternatingLeastSquares
 
@@ -136,11 +136,10 @@ def build_full_feature_matrix(features, train_rows):
     blocks = [current_dx, prior_dx, prior_med, current_proc, prior_proc, dense]
     for source in LAB_SOURCES:
         blocks.append(scale_train_fit(load_lab_source(source, train_rows), train_rows))
-    return hstack(blocks, format="csr")
-
-
-metrics = {}
-all_preds = {}
+    out = hstack(blocks, format="csr")
+    out.indptr = out.indptr.astype(np.int64)
+    out.indices = out.indices.astype(np.int64)
+    return out
 
 
 print("loading processed tables...")
@@ -177,13 +176,18 @@ test_hadm = hadm_ids[test_rows]
 
 print("building feature matrix...")
 feature_matrix = build_full_feature_matrix(features, train_rows)
-feature_matrix.indptr = feature_matrix.indptr.astype(np.int32)
-feature_matrix.indices = feature_matrix.indices.astype(np.int32)
 
 med_vocab = np.array(sorted(train_interactions["medication"].unique()))
 med_to_col = {med: i for i, med in enumerate(med_vocab)}
 med_ids = np.arange(len(med_vocab), dtype=np.int32)
 n_meds = len(med_vocab)
+
+def trim_preds(preds):
+    return {h: list(v)[:TOP_N_SAVED] for h, v in preds.items()}
+
+
+metrics = {}
+all_preds = {}
 
 
 def save_artifacts():
@@ -195,11 +199,6 @@ def save_artifacts():
             "train_ids": train_ids,
             "test_ids": test_ids,
         }, f)
-    print(f"saved to {ARTIFACTS_PATH}")
-
-
-def trim_preds(preds):
-    return {h: list(v)[:TOP_N_SAVED] for h, v in preds.items()}
 
 
 # save stuff needed for app.py
@@ -215,8 +214,8 @@ popularity_preds = {}
 for hadm_id in ground_truth:
     popularity_preds[hadm_id] = top_meds
 p, r, n = evaluate(popularity_preds, ground_truth)
-metrics["popularity"] = (p, r, n)
 print(f"\npopularity  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}")
+metrics["popularity"] = (p, r, n)
 all_preds["popularity"] = trim_preds(popularity_preds)
 save_artifacts()
 
@@ -276,8 +275,8 @@ for start in range(0, len(test_rows), KNN_BATCH_SIZE):
         knn_preds[hadm_id] = med_vocab[np.argsort(drug_scores)[::-1]].tolist()
 
 p, r, n = evaluate(knn_preds, ground_truth)
-metrics["knn"] = (p, r, n)
 print(f"knn  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["knn"] = (p, r, n)
 all_preds["knn"] = trim_preds(knn_preds)
 save_artifacts()
 
@@ -355,8 +354,8 @@ for row_idx, hadm_id in zip(test_rows, test_hadm):
     als_preds[hadm_id] = med_vocab[ids].tolist()
 
 p, r, n = evaluate(als_preds, ground_truth)
-metrics["als"] = (p, r, n)
 print(f"als  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["als"] = (p, r, n)
 all_preds["als"] = trim_preds(als_preds)
 save_artifacts()
 
@@ -385,7 +384,9 @@ lightfm_interactions = csr_matrix(
 )
 
 # scaled, normalized features
-lightfm_user_features = feature_matrix
+lightfm_user_features = feature_matrix.copy()
+lightfm_user_features.indptr = lightfm_user_features.indptr.astype(np.int32)
+lightfm_user_features.indices = lightfm_user_features.indices.astype(np.int32)
 
 t0 = time.time()
 print("training LightFM baseline...")
@@ -422,8 +423,8 @@ for start in range(0, len(test_rows), LIGHTFM_BATCH_SIZE):
         lightfm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(lightfm_preds, ground_truth)
-metrics["lightfm"] = (p, r, n)
 print(f"lightfm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["lightfm"] = (p, r, n)
 all_preds["lightfm"] = trim_preds(lightfm_preds)
 save_artifacts()
 
@@ -435,68 +436,134 @@ save_pickle("lightfm.pkl", lightfm_model)
 # tree models can learn more expressive non-linear patterns
 # each row is (admission, drug) pair -> 0/1 label
 # no embeddings like previous models
-LGBM_BATCH_SIZE = 1000
+LGBM_BATCH_SIZE = 250
+LGBM_BUILD_CHUNK = 20000
+
+mapped = train_interactions["medication"].map(med_to_col)
+valid = mapped.notna().to_numpy()
+hadm_arr = train_interactions["hadm_id"].to_numpy()[valid]
+col_arr = mapped.to_numpy()[valid].astype(np.int32)
+order = np.argsort(hadm_arr, kind="stable")
+hadm_s, col_s = hadm_arr[order], col_arr[order]
+uniq, starts = np.unique(hadm_s, return_index=True)
+ends = np.r_[starts[1:], len(hadm_s)]
+positive_cols_by_hadm = {h: np.unique(col_s[s:e]) for h, s, e in zip(uniq, starts, ends)}
+
+NEGATIVES_PER_POSITIVE = 10
+# we redo this to do 80% popularity instead of all random
+POPULARITY_NEGATIVE_MIX = 0.8
+
+med_counts = train_interactions["medication"].value_counts().reindex(med_vocab, fill_value=0).to_numpy(dtype=np.float64)
+popularity_probs = med_counts / med_counts.sum()
+negative_probs = POPULARITY_NEGATIVE_MIX * popularity_probs + (1.0 - POPULARITY_NEGATIVE_MIX) / n_meds
+
+# rebuild negative samples for 3 models below
+def sample_negative_cols(pos_cols, n_neg, rng):
+    weights = negative_probs.copy()
+    weights[pos_cols] = 0.0
+    weights /= weights.sum()
+    return rng.choice(n_meds, size=n_neg, replace=False, p=weights).astype(np.int32)
+
+def build_sampled_pair_arrays(hadm_values, rng):
+    row_chunks, col_chunks, y_chunks, groups = [], [], [], []
+    for hadm_id in sorted(hadm_values):
+        pos = positive_cols_by_hadm.get(hadm_id)
+        if pos is None:
+            continue
+        n_neg = min(NEGATIVES_PER_POSITIVE * len(pos), n_meds - len(pos))
+        neg = sample_negative_cols(pos, n_neg, rng)
+        cols = np.concatenate([pos, neg]).astype(np.int32)
+        y = np.concatenate([np.ones(len(pos), dtype=np.float32), np.zeros(len(neg), dtype=np.float32)])
+        row_chunks.append(np.full(len(cols), hadm_to_row[hadm_id], dtype=np.int32))
+        col_chunks.append(cols)
+        y_chunks.append(y)
+        groups.append(len(cols))
+    return np.concatenate(row_chunks), np.concatenate(col_chunks), np.concatenate(y_chunks), np.asarray(groups, dtype=np.int32)
+
 
 def build_lgbm_block(rows, cols):
-    drug_col = csr_matrix(np.asarray(cols, dtype=np.float32).reshape(-1, 1))
-    return hstack([feature_matrix[rows], drug_col], format="csr")
+    rows = np.asarray(rows, dtype=np.int32)
+    cols = np.asarray(cols, dtype=np.int32)
+    counts = np.diff(feature_matrix.indptr)[rows].astype(np.int64)
+    indptr = np.empty(len(rows) + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(counts + 1, out=indptr[1:])
 
-lgbm_all = labels[labels["hadm_id"].isin(train_ids)].copy()
-lgbm_all = lgbm_all[lgbm_all["candidate_drug"].isin(med_to_col)]
+    indices = np.empty(indptr[-1], dtype=np.int32)
+    data = np.empty(indptr[-1], dtype=np.float32)
+    for start in range(0, len(rows), LGBM_BUILD_CHUNK):
+        end = min(start + LGBM_BUILD_CHUNK, len(rows))
+        x = feature_matrix[rows[start:end]].tocsr()
+        x.indices = x.indices.astype(np.int32)
+        lo = indptr[start]
+        hi = indptr[end]
+        seg = indptr[start:end + 1] - lo
+        last = seg[1:] - 1
+        indices[lo + last] = feature_matrix.shape[1]
+        data[lo + last] = cols[start:end].astype(np.float32)
+        mask = np.ones(hi - lo, dtype=bool)
+        mask[last] = False
+        indices[lo:hi][mask] = x.indices
+        data[lo:hi][mask] = x.data.astype(np.float32)
+    return csr_matrix((data, indices, indptr), shape=(len(rows), feature_matrix.shape[1] + 1))
 
 all_train_hadm = np.array(sorted(train_ids))
 np.random.default_rng(RANDOM_STATE + 1).shuffle(all_train_hadm)
 n_val = int(len(all_train_hadm) * 0.1)
 val_hadm_set = set(all_train_hadm[:n_val].tolist())
+train_hadm_set = set(all_train_hadm[n_val:].tolist())
 
-train_df = (
-    lgbm_all[~lgbm_all["hadm_id"].isin(val_hadm_set)]
-    .sort_values("hadm_id")
-    .reset_index(drop=True)
-)
-val_df = (
-    lgbm_all[lgbm_all["hadm_id"].isin(val_hadm_set)]
-    .sort_values("hadm_id")
-    .reset_index(drop=True)
-)
+lgbm_params = {
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "label_gain": [0, 1],
+    "eval_at": [K],
+    "learning_rate": 0.05,
+    "num_leaves": 127,
+    "random_state": RANDOM_STATE,
+    "n_jobs": 4,
+    "force_col_wise": True,
+    "max_bin": 63,
+    "subsample": 0.8,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.8,
+    "verbose": -1,
+    "device": "gpu",
+}
 
-train_row_idx = train_df["hadm_id"].map(hadm_to_row).to_numpy()
-train_col_idx = train_df["candidate_drug"].map(med_to_col).to_numpy()
-train_y = train_df["label"].to_numpy()
-train_groups = train_df.groupby("hadm_id", sort=False).size().to_numpy()
+train_row_idx, train_col_idx, train_y, train_groups = build_sampled_pair_arrays(
+    train_hadm_set, np.random.default_rng(RANDOM_STATE + 2)
+)
 train_x = build_lgbm_block(train_row_idx, train_col_idx)
-train_x.sort_indices()
+train_data = Dataset(
+    train_x, label=train_y, group=train_groups,
+    categorical_feature=[feature_matrix.shape[1]],
+    free_raw_data=True,
+).construct()
+del train_x
 
-val_row_idx = val_df["hadm_id"].map(hadm_to_row).to_numpy()
-val_col_idx = val_df["candidate_drug"].map(med_to_col).to_numpy()
-val_y = val_df["label"].to_numpy()
-val_groups = val_df.groupby("hadm_id", sort=False).size().to_numpy()
+val_row_idx, val_col_idx, val_y, val_groups = build_sampled_pair_arrays(
+    val_hadm_set, np.random.default_rng(RANDOM_STATE + 3)
+)
 val_x = build_lgbm_block(val_row_idx, val_col_idx)
-val_x.sort_indices()
+val_data = Dataset(
+    val_x, label=val_y, group=val_groups,
+    reference=train_data,
+    categorical_feature=[feature_matrix.shape[1]],
+    free_raw_data=True,
+).construct()
+del val_x
 
 t0 = time.time()
 print("training LightGBM LambdaRank...")
-lgbm_model = LGBMRanker(
-    n_estimators=500,
-    learning_rate=0.05,
-    num_leaves=127,
-    objective="lambdarank",  # rank, not classify
-    label_gain=[0, 1],
-    eval_at=[K],
-    random_state=RANDOM_STATE,
-    n_jobs=8,
-    force_col_wise=True,
-    max_bin=63,
-    verbose=-1,
-    device='gpu',
-)
-lgbm_model.fit(
-    train_x, train_y, group=train_groups,
-    eval_set=[(val_x, val_y)],
-    eval_group=[val_groups],
-    categorical_feature=[feature_matrix.shape[1]],
+lgbm_model = lgb_train(
+    lgbm_params,
+    train_data,
+    num_boost_round=500,
+    valid_sets=[val_data],
     callbacks=[early_stopping(50), log_evaluation(100)],
 )
+del train_data, val_data
 
 # prediction
 lgbm_preds = {}
@@ -514,8 +581,8 @@ for start in range(0, len(test_rows), LGBM_BATCH_SIZE):
         lgbm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(lgbm_preds, ground_truth)
-metrics["lgbm"] = (p, r, n)
 print(f"lgbm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["lgbm"] = (p, r, n)
 all_preds["lgbm"] = trim_preds(lgbm_preds)
 save_artifacts()
 
@@ -526,15 +593,15 @@ save_pickle("lgbm.pkl", lgbm_model)
 
 DEEPFM_FACTORS = 32
 DEEPFM_EPOCHS = 20
-DEEPFM_LR = 0.001
-DEEPFM_BATCH_SIZE = 32
+DEEPFM_LR = 5e-4
+DEEPFM_BATCH_SIZE = 256
 DEEPFM_PRED_BATCH = 512
-DEEPFM_WEIGHT_DECAY = 1e-5
+DEEPFM_WEIGHT_DECAY = 1e-4
+DEEPFM_DROPOUT = 0.3
 
 # need to import here because of conflicts
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"torch device: {device}")
@@ -553,15 +620,19 @@ class DeepFM(nn.Module):
             feature_matrix.shape[1], DEEPFM_FACTORS, mode="sum", include_last_offset=True
         )
         self.drug_deep = nn.Embedding(n_meds, DEEPFM_FACTORS)
+        self.drug_bias = nn.Embedding(n_meds, 1)
         nn.init.normal_(self.linear.weight, std=1e-2)
         nn.init.normal_(self.fm.weight, std=1e-2)
         nn.init.normal_(self.user_deep.weight, std=1e-2)
         nn.init.normal_(self.drug_deep.weight, std=1e-2)
+        nn.init.zeros_(self.drug_bias.weight)
         self.deep = nn.Sequential(
             nn.Linear(DEEPFM_FACTORS * 2, 128),
             nn.ReLU(),
+            nn.Dropout(DEEPFM_DROPOUT),
             nn.Linear(128, 64),
             nn.ReLU(),
+            nn.Dropout(DEEPFM_DROPOUT),
             nn.Linear(64, 1),
         )
 
@@ -589,7 +660,8 @@ class DeepFM(nn.Module):
         )
         drug_part = self.drug_deep(drug_cols)
         deep_part = self.deep(torch.cat([user_part, drug_part], dim=1)).squeeze(1)
-        return linear_part + fm_part + deep_part
+        bias_part = self.drug_bias(drug_cols).squeeze(1)
+        return linear_part + fm_part + deep_part + bias_part
 
 
 def pairs_to_torch(feat_matrix, rows, cols):
@@ -599,20 +671,19 @@ def pairs_to_torch(feat_matrix, rows, cols):
     user_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
     user_offsets[1:] = np.cumsum(counts)
 
-    pair_counts = counts + 1
     pair_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
-    pair_offsets[1:] = np.cumsum(pair_counts)
+    pair_offsets[1:] = np.cumsum(counts + 1)
 
     idx = np.empty(pair_offsets[-1], dtype=np.int64)
     vals = np.empty(pair_offsets[-1], dtype=np.float32)
     for i in range(len(rows)):
         s, e = x.indptr[i], x.indptr[i + 1]
-        ps = pair_offsets[i]
+        off = pair_offsets[i]
         k = e - s
-        idx[ps:ps + k] = x.indices[s:e]
-        vals[ps:ps + k] = x.data[s:e]
-        idx[ps + k] = feat_matrix.shape[1] + cols[i]
-        vals[ps + k] = 1.0
+        idx[off:off + k] = x.indices[s:e]
+        vals[off:off + k] = x.data[s:e]
+        idx[off + k] = feat_matrix.shape[1] + cols[i]
+        vals[off + k] = 1.0
 
     return (
         torch.from_numpy(idx).to(device),
@@ -625,10 +696,11 @@ def pairs_to_torch(feat_matrix, rows, cols):
     )
 
 
-def train_torch_lambdarank(cls, feat_matrix, train_groups, val_groups, n_features, name, bs, epochs, lr, weight_decay):
+def train_torch_binary(cls, feat_matrix, train_groups, val_groups, n_features, name, bs, epochs, lr, weight_decay, patience=3):
     torch.manual_seed(RANDOM_STATE)
     model = cls(n_features).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.BCEWithLogitsLoss()
 
     train_keys = list(train_groups.keys())
     val_keys = list(val_groups.keys())
@@ -636,7 +708,20 @@ def train_torch_lambdarank(cls, feat_matrix, train_groups, val_groups, n_feature
     n_batches = int(np.ceil(len(train_keys) / bs))
 
     print(f"  {name}: {len(train_keys):,} train groups, "
-          f"{len(val_keys):,} val groups, up to {epochs} epochs", flush=True)
+          f"{len(val_keys):,} val groups, up to {epochs} epochs "
+          f"(early stop patience={patience})", flush=True)
+
+    val_sample = np.random.default_rng(RANDOM_STATE).choice(
+        np.asarray(val_keys), size=min(1500, len(val_keys)), replace=False
+    )
+    val_row_ids = np.array([hadm_to_row[h] for h in val_sample], dtype=np.int32)
+    sample_rows = np.repeat(val_row_ids, n_meds)
+    sample_cols = np.tile(np.arange(n_meds, dtype=np.int32), len(val_sample))
+
+    best_ndcg = -1.0
+    best_state = None
+    best_epoch = 0
+    bad_epochs = 0
 
     for epoch in range(1, epochs + 1):
         rng.shuffle(train_keys)
@@ -646,47 +731,52 @@ def train_torch_lambdarank(cls, feat_matrix, train_groups, val_groups, n_feature
 
         for start in range(0, len(train_keys), bs):
             batch_keys = train_keys[start:start + bs]
-            cols_list, rows_list, splits, n_pos_list = [], [], [0], []
+            cols_list, rows_list, y_list = [], [], []
             for hadm_id in batch_keys:
-                pos, neg = train_groups[hadm_id]
+                pos = train_groups[hadm_id]
+                n_neg = min(NEGATIVES_PER_POSITIVE * len(pos), n_meds - len(pos))
+                neg = sample_negative_cols(pos, n_neg, rng)
                 cols_list.append(np.concatenate([pos, neg]))
                 rows_list.append(np.full(len(pos) + len(neg), hadm_to_row[hadm_id], dtype=np.int32))
-                splits.append(splits[-1] + len(pos) + len(neg))
-                n_pos_list.append(len(pos))
+                y_list.append(np.concatenate([
+                    np.ones(len(pos), dtype=np.float32),
+                    np.zeros(len(neg), dtype=np.float32),
+                ]))
             cols = np.concatenate(cols_list).astype(np.int32)
             rows = np.concatenate(rows_list)
+            y = torch.from_numpy(np.concatenate(y_list)).to(device)
 
             scores = model(*pairs_to_torch(feat_matrix, rows, cols))
             opt.zero_grad()
-            loss = 0.0
-            for i, (s, e) in enumerate(zip(splits[:-1], splits[1:])):
-                n_pos = n_pos_list[i]
-                sc = scores[s:e]
-                with torch.no_grad():
-                    disc = 1.0 / torch.log2(sc.argsort(descending=True).argsort().float() + 2)
-                pos_s, neg_s = sc[:n_pos].unsqueeze(1), sc[n_pos:].unsqueeze(0)
-                lam = (disc[:n_pos].unsqueeze(1) - disc[n_pos:].unsqueeze(0)).abs()
-                loss = loss + (lam * F.softplus(neg_s - pos_s)).sum() / lam.sum()
-            loss = loss / len(batch_keys)
+            loss = loss_fn(scores, y)
             loss.backward()
             opt.step()
             epoch_loss += loss.item()
 
         model.eval()
+        all_scores = predict_model(model, sample_rows, sample_cols).reshape(len(val_sample), n_meds)
         n_list = []
-        with torch.no_grad():
-            for hadm_id in val_keys:
-                pos, neg = val_groups[hadm_id]
-                cols = np.concatenate([pos, neg]).astype(np.int32)
-                rows = np.full(len(cols), hadm_to_row[hadm_id], dtype=np.int32)
-                sc = model(*pairs_to_torch(feat_matrix, rows, cols)).cpu().numpy()
-                order = np.argsort(sc)[::-1]
-                n_list.append(ndcg_at_k(cols[order].tolist()[:K], set(pos.tolist())))
+        for i, hadm_id in enumerate(val_sample):
+            pos = val_groups[hadm_id]
+            order = np.argsort(-all_scores[i])
+            n_list.append(ndcg_at_k(med_vocab[order].tolist()[:K], set(med_vocab[pos].tolist())))
         val_ndcg = float(np.mean(n_list))
 
         print(f"  {name} epoch {epoch}/{epochs}  loss={epoch_loss / n_batches:.4f}  "
               f"val_ndcg={val_ndcg:.4f}  ({time.time() - epoch_t0:.0f}s)", flush=True)
 
+        if val_ndcg > best_ndcg:
+            best_ndcg = val_ndcg
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f"  {name} early stop at epoch {epoch} (best epoch {best_epoch}, val_ndcg={best_ndcg:.4f})", flush=True)
+                break
+
+    model.load_state_dict(best_state)
     return model
 
 
@@ -703,24 +793,14 @@ def predict_model(model, rows, cols):
     return out
 
 
-candidate_pairs = labels[labels["hadm_id"].isin(train_ids)].copy()
-candidate_pairs = candidate_pairs[candidate_pairs["candidate_drug"].isin(med_to_col)]
-candidate_pairs["col"] = candidate_pairs["candidate_drug"].map(med_to_col).astype(np.int32)
-
-torch_train_groups, torch_val_groups = {}, {}
-for hadm_id, grp in candidate_pairs.groupby("hadm_id"):
-    pos = grp.loc[grp["label"] == 1, "col"].to_numpy()
-    neg = grp.loc[grp["label"] == 0, "col"].to_numpy()
-    if not (len(pos) and len(neg)):
-        continue
-    bucket = torch_val_groups if hadm_id in val_hadm_set else torch_train_groups
-    bucket[hadm_id] = (pos, neg)
+torch_train_groups = {h: pos for h, pos in positive_cols_by_hadm.items() if h in train_hadm_set}
+torch_val_groups = {h: pos for h, pos in positive_cols_by_hadm.items() if h in val_hadm_set}
 
 n_features = feature_matrix.shape[1] + n_meds
 
 t0 = time.time()
 print("training deepfm model...", flush=True)
-deepfm_model = train_torch_lambdarank(
+deepfm_model = train_torch_binary(
     DeepFM, feature_matrix, torch_train_groups, torch_val_groups, n_features,
     "deepfm", DEEPFM_BATCH_SIZE, DEEPFM_EPOCHS, DEEPFM_LR, DEEPFM_WEIGHT_DECAY,
 )
@@ -741,8 +821,8 @@ for start in range(0, len(test_rows), DEEPFM_PRED_BATCH):
         deepfm_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(deepfm_preds, ground_truth)
-metrics["deepfm"] = (p, r, n)
 print(f"deepfm  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["deepfm"] = (p, r, n)
 all_preds["deepfm"] = trim_preds(deepfm_preds)
 save_artifacts()
 
@@ -752,11 +832,12 @@ save_artifacts()
 DCNV2_EMBED_DIM = 64
 DCNV2_N_CROSS = 3
 DCNV2_EPOCHS = 20
-DCNV2_LR = 0.001
-DCNV2_BATCH_SIZE = 32
+DCNV2_LR = 5e-4
+DCNV2_BATCH_SIZE = 256
 DCNV2_PRED_BATCH = 512
-DCNV2_WEIGHT_DECAY = 1e-5
+DCNV2_WEIGHT_DECAY = 1e-4
 DCNV2_RANK = 16
+DCNV2_DROPOUT = 0.3
 
 class CrossLayer(nn.Module):
     def __init__(self, dim, rank):
@@ -775,6 +856,8 @@ class DCNV2(nn.Module):
             feature_matrix.shape[1], DCNV2_EMBED_DIM, mode="sum", include_last_offset=True
         )
         self.drug_embed = nn.Embedding(n_meds, DCNV2_EMBED_DIM)
+        self.bias = nn.Embedding(n_meds, 1)
+        nn.init.zeros_(self.bias.weight)
         dim = DCNV2_EMBED_DIM * 2
         nn.init.normal_(self.user_embed.weight, std=1e-2)
         nn.init.normal_(self.drug_embed.weight, std=1e-2)
@@ -784,8 +867,10 @@ class DCNV2(nn.Module):
         self.deep = nn.Sequential(
             nn.Linear(dim, 128),
             nn.ReLU(),
+            nn.Dropout(DCNV2_DROPOUT),
             nn.Linear(128, 64),
             nn.ReLU(),
+            nn.Dropout(DCNV2_DROPOUT),
         )
         self.out = nn.Linear(dim + 64, 1)
 
@@ -798,12 +883,13 @@ class DCNV2(nn.Module):
         x = x0
         for layer in self.cross:
             x = layer(x0, x)
-        return self.out(torch.cat([x, self.deep(x0)], dim=1)).squeeze(1)
+        bias_part = self.bias(drug_cols).squeeze(1)
+        return self.out(torch.cat([x, self.deep(x0)], dim=1)).squeeze(1) + bias_part
 
 
 t0 = time.time()
 print("training dcnv2 model...", flush=True)
-dcnv2_model = train_torch_lambdarank(
+dcnv2_model = train_torch_binary(
     DCNV2, feature_matrix, torch_train_groups, torch_val_groups, n_features,
     "dcnv2", DCNV2_BATCH_SIZE, DCNV2_EPOCHS, DCNV2_LR, DCNV2_WEIGHT_DECAY,
 )
@@ -824,7 +910,7 @@ for start in range(0, len(test_rows), DCNV2_PRED_BATCH):
         dcnv2_preds[hadm_id] = med_vocab[ranking].tolist()
 
 p, r, n = evaluate(dcnv2_preds, ground_truth)
-metrics["dcnv2"] = (p, r, n)
 print(f"dcnv2  P@{K}={p:.4f}  R@{K}={r:.4f}  NDCG@{K}={n:.4f}  ({time.time() - t0:.0f}s)")
+metrics["dcnv2"] = (p, r, n)
 all_preds["dcnv2"] = trim_preds(dcnv2_preds)
 save_artifacts()
