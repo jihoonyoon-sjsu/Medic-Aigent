@@ -13,3 +13,6 @@ https://drive.google.com/file/d/1FCH_-mDz7NBdiulAeONB7mrdG7RH0KkJ/view?usp=share
 4. Put that folder in your Google drive, where your notebook is. 
 5. Pick a runtime. Some models only run on CPU, some utilize GPU.
 6. Run it. Necessary packages should download as you run the cells.
+
+## requirements.txt
+Requirements.txt is not included in this github because all of our packages are handled inside the Colab notebook.
