@@ -23,4 +23,4 @@ run these commands in order:
 4. streamlit run app.py
 
 ## Note about requirements.txt
-Requirements.txt in this notebook is just for the front end. All packages required for the Colab notebook are included in the Colab environment or installed in the cells.
+Requirements.txt in this notebook is just for the front end. It is located in the /app subfolder. All packages required for the Colab notebook are included in the Colab environment or installed in the cells.
