@@ -14,5 +14,13 @@ https://drive.google.com/file/d/1FCH_-mDz7NBdiulAeONB7mrdG7RH0KkJ/view?usp=share
 5. Pick a runtime. Some models only run on CPU, some utilize GPU.
 6. Run it. Necessary packages should download as you run the cells.
 
-## requirements.txt
-Requirements.txt is not included in this github because all of our packages are handled inside the Colab notebook.
+## Running the front end:
+cd into the /app folder
+run these commands in order:
+1. python3 -m venv .venv
+2. source .venv/bin/activate (macOS) (.venv\Scripts\activate for Windows)
+3. pip install -r requirements.txt
+4. streamlit run app.py
+
+## Note about requirements.txt
+Requirements.txt in this notebook is just for the front end. All packages required for the Colab notebook are included in the Colab environment or installed in the cells.
